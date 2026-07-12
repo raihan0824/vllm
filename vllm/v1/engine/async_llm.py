@@ -167,6 +167,21 @@ class AsyncLLM(EngineClient):
 
         self._client_count = client_count
 
+        # Admission control (backpressure). When --max-waiting-requests is set,
+        # cap the number of in-flight (running + waiting) requests the frontend
+        # will admit at max_num_seqs + max_waiting_requests. Requests beyond
+        # that are rejected before tokenization/prefill (HTTP 429). The reserved
+        # counter is maintained synchronously by the frontend for the whole
+        # request lifetime, so a simultaneous burst cannot overshoot the bound.
+        scheduler_config = vllm_config.scheduler_config
+        max_waiting_requests = scheduler_config.max_waiting_requests
+        self.max_inflight_requests: int | None = (
+            None
+            if max_waiting_requests is None
+            else scheduler_config.max_num_seqs + max_waiting_requests
+        )
+        self._reserved_requests = 0
+
         self.output_handler: asyncio.Task | None = None
         try:
             # Start output handler eagerly if we are in the asyncio eventloop.
@@ -269,6 +284,48 @@ class AsyncLLM(EngineClient):
         handler = getattr(self, "output_handler", None)
         if handler is not None:
             cancel_task_threadsafe(handler)
+
+    def admission_control_enabled(self) -> bool:
+        """Whether --max-waiting-requests backpressure is active."""
+        return self.max_inflight_requests is not None
+
+    def try_reserve_request_slot(self) -> bool:
+        """Reserve an admission slot, or return False if the queue is full.
+
+        Backpressure proxy: reserved slots == in-flight (running + waiting)
+        requests at the frontend. Since running is bounded by max_num_seqs,
+        capping in-flight at ``max_num_seqs + max_waiting_requests`` bounds the
+        waiting queue to at most ``max_waiting_requests``. The increment is
+        synchronous (no await) so a concurrent burst cannot overshoot the cap.
+        """
+        if self.max_inflight_requests is None:
+            return True
+        if self._reserved_requests >= self.max_inflight_requests:
+            return False
+        self._reserved_requests += 1
+        return True
+
+    def release_request_slot(self) -> None:
+        """Release a slot reserved by try_reserve_request_slot()."""
+        if self.max_inflight_requests is None:
+            return
+        # Guard against underflow if release is somehow called without a
+        # matching successful reservation.
+        if self._reserved_requests > 0:
+            self._reserved_requests -= 1
+
+    def record_request_rejected(self, reason: str) -> None:
+        """Record a request rejected before admission (backpressure)."""
+        if self.logger_manager is not None:
+            self.logger_manager.record_request_rejected(reason)
+        if self.log_requests:
+            logger.info(
+                "Rejected request: engine overloaded (reason=%s, "
+                "in_flight=%d, limit=%s).",
+                reason,
+                self._reserved_requests,
+                self.max_inflight_requests,
+            )
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):

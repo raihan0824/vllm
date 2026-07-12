@@ -70,6 +70,9 @@ class StatLoggerBase(ABC):
     def record_sleep_state(self, is_awake: int, level: int):  # noqa
         pass
 
+    def record_request_rejected(self, reason: str):  # noqa
+        pass
+
 
 def load_stat_logger_plugin_factories() -> list[StatLoggerFactory]:
     factories: list[StatLoggerFactory] = []
@@ -428,6 +431,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
         labelnames = ["model_name", "engine"]
         model_name = vllm_config.model_config.served_model_name
+        self.model_name = model_name
         max_model_len = vllm_config.model_config.max_model_len
 
         self.per_engine_labelvalues: dict[int, list[object]] = {
@@ -537,6 +541,23 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.counter_corrupted_requests = create_metric_per_engine(
                 counter_corrupted_requests, per_engine_labelvalues
+            )
+
+        # Requests rejected before admission (frontend backpressure). This is
+        # a frontend-global event (not attributable to a single scheduler), so
+        # it is labeled by model_name + reason only, and incremented directly
+        # via record_request_rejected() rather than from scheduler stats. Only
+        # created when --max-waiting-requests is set, so there is no behavior
+        # change (no new metric series) when the feature is unused.
+        self.counter_num_requests_rejected: Counter | None = None
+        if vllm_config.scheduler_config.max_waiting_requests is not None:
+            self.counter_num_requests_rejected = self._counter_cls(
+                name="vllm:num_requests_rejected",
+                documentation=(
+                    "Number of requests rejected before admission due to engine "
+                    "backpressure (e.g. the waiting queue is full)."
+                ),
+                labelnames=["model_name", "reason"],
             )
 
         counter_prefix_cache_queries = self._counter_cls(
@@ -1235,6 +1256,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.gauge_engine_sleep_state["awake"][engine_idx].set(awake)
 
+    def record_request_rejected(self, reason: str):
+        if self.counter_num_requests_rejected is not None:
+            self.counter_num_requests_rejected.labels(self.model_name, reason).inc()
+
     def log_engine_initialized(self):
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
 
@@ -1350,6 +1375,10 @@ class StatLoggerManager:
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         for logger in self.stat_loggers:
             logger.record_sleep_state(sleep, level)
+
+    def record_request_rejected(self, reason: str):
+        for logger in self.stat_loggers:
+            logger.record_request_rejected(reason)
 
     def log(self):
         for logger in self.stat_loggers:

@@ -67,6 +67,17 @@ class SchedulerConfig:
     In real usage, this should be set in `EngineArgs.create_engine_config`.
     """
 
+    max_waiting_requests: int | None = Field(default=None, ge=0)
+    """Maximum number of requests allowed to sit in the scheduler's waiting
+    queue before the frontend applies backpressure.
+
+    When `None` (default), the waiting queue is unbounded and behavior is
+    unchanged. When set, an incoming request that would push the number of
+    in-flight (running + waiting) requests above
+    `max_num_seqs + max_waiting_requests` is rejected immediately with an
+    HTTP 429 response, before any tokenization or prefill work is done. This
+    trades a fast rejection for bounded queueing latency under burst load."""
+
     max_num_partial_prefills: int = Field(default=1, ge=1)
     """For chunked prefill, the maximum number of sequences that can be
     partially prefilled concurrently."""

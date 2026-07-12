@@ -94,8 +94,45 @@ def with_cancellation(handler_func):
     return wrapper
 
 
-def decrement_server_load(request: Request):
-    request.app.state.server_load_metrics -= 1
+# Backpressure (admission control) response. Returned before any
+# tokenization/prefill work when the engine's waiting queue is full. Shaped as
+# an OpenAI-style rate-limit error so downstream proxies (e.g. LiteLLM) parse
+# it, and carries Retry-After so clients/ingress can retry another replica.
+ENGINE_OVERLOADED_RETRY_AFTER_SECONDS = 2
+ENGINE_OVERLOADED_MESSAGE = "Engine overloaded: request queue is full"
+
+
+def engine_overloaded_response() -> JSONResponse:
+    return JSONResponse(
+        content={
+            "error": {
+                "message": ENGINE_OVERLOADED_MESSAGE,
+                "type": "rate_limit_error",
+                "code": 429,
+            }
+        },
+        status_code=429,
+        headers={"Retry-After": str(ENGINE_OVERLOADED_RETRY_AFTER_SECONDS)},
+    )
+
+
+def _run_after_response(response, callback) -> None:
+    """Schedule a zero-arg callback to run once `response` is fully sent.
+
+    Chains onto any existing background task(s) on the response so we don't
+    clobber cleanup registered elsewhere.
+    """
+    if response.background is None:
+        response.background = BackgroundTask(callback)
+    elif isinstance(response.background, BackgroundTasks):
+        response.background.add_task(callback)
+    else:
+        # Single BackgroundTask -> convert to BackgroundTasks and chain.
+        existing = response.background
+        tasks = BackgroundTasks()
+        tasks.add_task(existing.func, *existing.args, **existing.kwargs)
+        tasks.add_task(callback)
+        response.background = tasks
 
 
 def load_aware_call(func):
@@ -108,38 +145,55 @@ def load_aware_call(func):
                 "raw_request required when server load tracking is enabled"
             )
 
-        if not getattr(raw_request.app.state, "enable_server_load_tracking", False):
+        app_state = raw_request.app.state
+
+        # --- Admission control (backpressure). Runs before the handler, so a
+        # rejected request does zero tokenization/prefill work and streaming
+        # requests are rejected before any SSE bytes are sent. Fully skipped
+        # (zero behavior change) when --max-waiting-requests is unset. ---
+        engine_client = getattr(app_state, "engine_client", None)
+        admission = (
+            engine_client is not None and engine_client.admission_control_enabled()
+        )
+        if admission and not engine_client.try_reserve_request_slot():
+            engine_client.record_request_rejected("queue_full")
+            return engine_overloaded_response()
+
+        load_tracking = getattr(app_state, "enable_server_load_tracking", False)
+        if load_tracking:
+            # ensure the counter exists
+            if not hasattr(app_state, "server_load_metrics"):
+                app_state.server_load_metrics = 0
+            app_state.server_load_metrics += 1
+
+        if not admission and not load_tracking:
             return await func(*args, **kwargs)
 
-        # ensure the counter exists
-        if not hasattr(raw_request.app.state, "server_load_metrics"):
-            raw_request.app.state.server_load_metrics = 0
+        def cleanup() -> None:
+            if admission:
+                engine_client.release_request_slot()
+            if load_tracking:
+                app_state.server_load_metrics -= 1
 
-        raw_request.app.state.server_load_metrics += 1
         try:
             response = await func(*args, **kwargs)
+        except asyncio.CancelledError:
+            # Client disconnect / cancellation. Release the admission slot;
+            # server_load is decremented by listen_for_disconnect (preserving
+            # the pre-existing behavior), so don't touch it here.
+            if admission:
+                engine_client.release_request_slot()
+            raise
         except Exception:
-            raw_request.app.state.server_load_metrics -= 1
+            cleanup()
             raise
 
         if isinstance(response, (JSONResponse, StreamingResponse)):
-            if response.background is None:
-                response.background = BackgroundTask(decrement_server_load, raw_request)
-            elif isinstance(response.background, BackgroundTasks):
-                response.background.add_task(decrement_server_load, raw_request)
-            elif isinstance(response.background, BackgroundTask):
-                # Convert the single BackgroundTask to BackgroundTasks
-                # and chain the decrement_server_load task to it
-                tasks = BackgroundTasks()
-                tasks.add_task(
-                    response.background.func,
-                    *response.background.args,
-                    **response.background.kwargs,
-                )
-                tasks.add_task(decrement_server_load, raw_request)
-                response.background = tasks
+            # Hold the reservation until the response (incl. the full SSE
+            # stream) has been sent, then release.
+            _run_after_response(response, cleanup)
         else:
-            raw_request.app.state.server_load_metrics -= 1
+            cleanup()
 
         return response
 

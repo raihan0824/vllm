@@ -218,6 +218,46 @@ class EngineClient(ABC):
         """Shutdown the engine with optional timeout."""
         ...
 
+    def admission_control_enabled(self) -> bool:
+        """Whether backpressure/admission control is active for this engine.
+
+        When ``False`` (the default), frontends skip all reservation work and
+        behavior is identical to an unbounded queue. Enabled by setting
+        ``--max-waiting-requests``.
+        """
+        return False
+
+    def try_reserve_request_slot(self) -> bool:
+        """Synchronously admit a request under backpressure (admission control).
+
+        Called by the frontend before any tokenization or prefill work. If a
+        slot is available it is reserved (an in-flight counter is incremented)
+        and ``True`` is returned; the caller MUST later call
+        :meth:`release_request_slot` exactly once when the request finishes.
+        If the engine's waiting queue is full, ``False`` is returned and no
+        slot is reserved.
+
+        The reservation is synchronous (no ``await`` before the counter is
+        bumped) so that a simultaneous burst of requests sees each other's
+        reservations and cannot collectively overshoot the bound. The default
+        implementation always admits, preserving the historical unbounded-queue
+        behavior.
+        """
+        return True
+
+    def release_request_slot(self) -> None:  # noqa: B027
+        """Release a slot previously reserved by :meth:`try_reserve_request_slot`."""
+        pass
+
+    def record_request_rejected(self, reason: str) -> None:  # noqa: B027
+        """Record that an incoming request was rejected before admission.
+
+        Args:
+            reason: Short machine-readable reason label (e.g. ``queue_full``)
+                used for the ``vllm:num_requests_rejected_total`` metric.
+        """
+        pass
+
     async def scale_elastic_ep(
         self, new_data_parallel_size: int, drain_timeout: int = 300
     ) -> None:
