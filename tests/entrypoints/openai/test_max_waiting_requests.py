@@ -23,7 +23,10 @@ MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"
 
 MAX_NUM_SEQS = 2
 MAX_WAITING_REQUESTS = 1
-# Frontend admits at most this many in-flight (running + waiting) requests.
+# The frontend admits at most capacity_estimate + MAX_WAITING_REQUESTS
+# in-flight requests. The capacity estimate adapts to the engine's actual
+# sustained running count; for this tiny model KV cache is plentiful, so the
+# engine saturates exactly at MAX_NUM_SEQS and the admission cap is stable at:
 CAPACITY = MAX_NUM_SEQS + MAX_WAITING_REQUESTS
 
 # Long enough (with ignore_eos) that an accepted request stays in-flight for a

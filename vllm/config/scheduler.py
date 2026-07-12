@@ -73,10 +73,14 @@ class SchedulerConfig:
 
     When `None` (default), the waiting queue is unbounded and behavior is
     unchanged. When set, an incoming request that would push the number of
-    in-flight (running + waiting) requests above
-    `max_num_seqs + max_waiting_requests` is rejected immediately with an
-    HTTP 429 response, before any tokenization or prefill work is done. This
-    trades a fast rejection for bounded queueing latency under burst load."""
+    in-flight (running + waiting) requests above the engine's estimated
+    serving capacity plus `max_waiting_requests` is rejected immediately with
+    an HTTP 429 response, before any tokenization or prefill work is done.
+    The capacity estimate adapts to what the engine actually sustains: when
+    the engine reports a backlog, its current running count is used (it may
+    be KV-cache bound below `max_num_seqs`); otherwise `max_num_seqs` is
+    assumed. This trades a fast rejection for bounded queueing latency under
+    burst load."""
 
     max_num_partial_prefills: int = Field(default=1, ge=1)
     """For chunked prefill, the maximum number of sequences that can be

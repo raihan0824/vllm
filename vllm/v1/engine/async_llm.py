@@ -50,7 +50,7 @@ from vllm.v1.metrics.loggers import (
     load_stat_logger_plugin_factories,
 )
 from vllm.v1.metrics.prometheus import shutdown_prometheus
-from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 logger = init_logger(__name__)
 
@@ -65,6 +65,64 @@ class InputStreamError(Exception):
     def __init__(self, cause: Exception):
         self.cause = cause
         super().__init__(str(cause))
+
+
+class AdmissionController:
+    """Frontend admission control for --max-waiting-requests backpressure.
+
+    Bounds the engine's waiting queue by rejecting new requests once the
+    number of frontend in-flight (admitted-but-not-finished) requests would
+    exceed the engine's estimated serving capacity plus max_waiting_requests.
+
+    The in-flight count is a synchronous reservation counter, so a concurrent
+    burst of requests cannot collectively overshoot the bound. The capacity
+    estimate adapts to what the engine actually sustains via the per-step
+    SchedulerStats it reports: when the engine has a backlog (non-empty
+    waiting queue), its current running count *is* its capacity — it may be
+    KV-cache bound well below max_num_seqs. When its queue is empty,
+    max_num_seqs is assumed.
+    """
+
+    def __init__(self, max_num_seqs: int, max_waiting_requests: int):
+        self.max_num_seqs = max_num_seqs
+        self.max_waiting_requests = max_waiting_requests
+        self.reserved = 0
+        # engine_idx -> (num_running, num_waiting incl. deferred)
+        self._engine_stats: dict[int, tuple[int, int]] = {}
+
+    def update_stats(self, engine_idx: int, stats: SchedulerStats) -> None:
+        self._engine_stats[engine_idx] = (
+            stats.num_running_reqs,
+            stats.num_waiting_reqs + stats.num_skipped_waiting_reqs,
+        )
+
+    def capacity_estimate(self) -> int:
+        if not self._engine_stats:
+            # No stats received yet (cold start): assume full capacity.
+            return self.max_num_seqs
+        total_running = 0
+        total_waiting = 0
+        for num_running, num_waiting in self._engine_stats.values():
+            total_running += num_running
+            total_waiting += num_waiting
+        if total_waiting > 0:
+            # The engine has a backlog, so it cannot currently run more
+            # requests than it already does (e.g. KV-cache bound below
+            # max_num_seqs). Its running count is its capacity.
+            return total_running
+        return max(self.max_num_seqs * len(self._engine_stats), total_running)
+
+    def try_reserve(self) -> bool:
+        if self.reserved + 1 > self.capacity_estimate() + self.max_waiting_requests:
+            return False
+        self.reserved += 1
+        return True
+
+    def release(self) -> None:
+        # Guard against underflow if release is somehow called without a
+        # matching successful reservation.
+        if self.reserved > 0:
+            self.reserved -= 1
 
 
 class AsyncLLM(EngineClient):
@@ -129,6 +187,25 @@ class AsyncLLM(EngineClient):
                 "enabling logging without default stat loggers."
             )
 
+        # Admission control (backpressure). When --max-waiting-requests is
+        # set, requests beyond the engine's estimated capacity plus the bound
+        # are rejected before tokenization/prefill (HTTP 429). The capacity
+        # estimate is fed by per-step SchedulerStats, so stats collection is
+        # required.
+        max_waiting_requests = vllm_config.scheduler_config.max_waiting_requests
+        self.admission_controller: AdmissionController | None = None
+        if max_waiting_requests is not None:
+            self.admission_controller = AdmissionController(
+                max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+                max_waiting_requests=max_waiting_requests,
+            )
+            if not self.log_stats:
+                self.log_stats = True
+                logger.info(
+                    "--max-waiting-requests admission control requires "
+                    "scheduler stats; enabling stats collection."
+                )
+
         self.renderer = renderer = renderer_from_config(self.vllm_config)
 
         # Convert EngineInput --> EngineCoreRequest.
@@ -166,21 +243,6 @@ class AsyncLLM(EngineClient):
             self.logger_manager.log_engine_initialized()
 
         self._client_count = client_count
-
-        # Admission control (backpressure). When --max-waiting-requests is set,
-        # cap the number of in-flight (running + waiting) requests the frontend
-        # will admit at max_num_seqs + max_waiting_requests. Requests beyond
-        # that are rejected before tokenization/prefill (HTTP 429). The reserved
-        # counter is maintained synchronously by the frontend for the whole
-        # request lifetime, so a simultaneous burst cannot overshoot the bound.
-        scheduler_config = vllm_config.scheduler_config
-        max_waiting_requests = scheduler_config.max_waiting_requests
-        self.max_inflight_requests: int | None = (
-            None
-            if max_waiting_requests is None
-            else scheduler_config.max_num_seqs + max_waiting_requests
-        )
-        self._reserved_requests = 0
 
         self.output_handler: asyncio.Task | None = None
         try:
@@ -287,44 +349,36 @@ class AsyncLLM(EngineClient):
 
     def admission_control_enabled(self) -> bool:
         """Whether --max-waiting-requests backpressure is active."""
-        return self.max_inflight_requests is not None
+        return self.admission_controller is not None
 
     def try_reserve_request_slot(self) -> bool:
         """Reserve an admission slot, or return False if the queue is full.
 
-        Backpressure proxy: reserved slots == in-flight (running + waiting)
-        requests at the frontend. Since running is bounded by max_num_seqs,
-        capping in-flight at ``max_num_seqs + max_waiting_requests`` bounds the
-        waiting queue to at most ``max_waiting_requests``. The increment is
-        synchronous (no await) so a concurrent burst cannot overshoot the cap.
+        See AdmissionController: the reservation is synchronous (no await) so
+        a concurrent burst cannot overshoot the cap, and the cap adapts to the
+        engine's actual serving capacity via per-step SchedulerStats.
         """
-        if self.max_inflight_requests is None:
+        if self.admission_controller is None:
             return True
-        if self._reserved_requests >= self.max_inflight_requests:
-            return False
-        self._reserved_requests += 1
-        return True
+        return self.admission_controller.try_reserve()
 
     def release_request_slot(self) -> None:
         """Release a slot reserved by try_reserve_request_slot()."""
-        if self.max_inflight_requests is None:
-            return
-        # Guard against underflow if release is somehow called without a
-        # matching successful reservation.
-        if self._reserved_requests > 0:
-            self._reserved_requests -= 1
+        if self.admission_controller is not None:
+            self.admission_controller.release()
 
     def record_request_rejected(self, reason: str) -> None:
         """Record a request rejected before admission (backpressure)."""
         if self.logger_manager is not None:
             self.logger_manager.record_request_rejected(reason)
-        if self.log_requests:
+        if self.log_requests and (controller := self.admission_controller):
             logger.info(
-                "Rejected request: engine overloaded (reason=%s, "
-                "in_flight=%d, limit=%s).",
+                "Rejected request: engine overloaded (reason=%s, in_flight=%d, "
+                "capacity_estimate=%d, max_waiting_requests=%d).",
                 reason,
-                self._reserved_requests,
-                self.max_inflight_requests,
+                controller.reserved,
+                controller.capacity_estimate(),
+                controller.max_waiting_requests,
             )
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
@@ -709,6 +763,7 @@ class AsyncLLM(EngineClient):
         logger_ref = self._logger_ref
         renderer = self.renderer
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
+        admission_controller = self.admission_controller
 
         async def output_handler():
             try:
@@ -746,6 +801,16 @@ class AsyncLLM(EngineClient):
                             )
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
+
+                    # Feed the admission controller's capacity estimate
+                    # (backpressure for --max-waiting-requests).
+                    if (
+                        admission_controller is not None
+                        and outputs.scheduler_stats is not None
+                    ):
+                        admission_controller.update_stats(
+                            outputs.engine_index, outputs.scheduler_stats
+                        )
 
                     # 4) Logging.
                     # TODO(rob): make into a coroutine and launch it in
