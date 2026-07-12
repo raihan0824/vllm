@@ -1,0 +1,39 @@
+# --max-waiting-requests backpressure patch (HTTP 429 on full queue).
+# Patch verified to apply cleanly (--fuzz=0, offsets only) against
+# dekaregistry.cloudeka.id/cloudeka-system/vllm-openai:v0.24.0.
+FROM dekaregistry.cloudeka.id/cloudeka-system/vllm-openai:v0.24.0
+
+# The mirror image runs as UID 1000; site-packages needs root to patch.
+USER root
+
+COPY patches/max-waiting-requests.patch /tmp/max-waiting-requests.patch
+
+# Apply the patch to the installed vllm and fail the build unless it applies
+# exactly and the new flag/interfaces import cleanly (fail-closed).
+RUN set -e; \
+    VLLM_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))"); \
+    cd "$(dirname "$VLLM_DIR")"; \
+    patch -p1 --fuzz=0 < /tmp/max-waiting-requests.patch; \
+    python3 -c "\
+from vllm.engine.arg_utils import EngineArgs; \
+from vllm.engine.protocol import EngineClient; \
+assert EngineArgs().max_waiting_requests is None; \
+assert hasattr(EngineClient, 'try_reserve_request_slot'); \
+import vllm.v1.engine.async_llm, vllm.v1.metrics.loggers, \
+       vllm.entrypoints.serve.utils.api_utils; \
+print('mwr patch verified')"; \
+    rm /tmp/max-waiting-requests.patch
+
+# Check if UID 1000 exists, if not create appuser, if yes use existing user or create with different UID
+RUN if id -u 1000 >/dev/null 2>&1; then \
+        echo "UID 1000 already exists, using existing user"; \
+        existing_user=$(getent passwd 1000 | cut -d: -f1); \
+        if [ "$existing_user" != "appuser" ]; then \
+            usermod -l appuser -d /home/appuser -m $existing_user 2>/dev/null || echo "User rename failed, continuing with existing user"; \
+        fi; \
+    else \
+        useradd -u 1000 -m -s /bin/bash appuser; \
+    fi
+
+RUN chown -R 1000:1000 /home/appuser 2>/dev/null || echo "Chown completed with warnings"
+USER 1000

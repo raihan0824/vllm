@@ -1,0 +1,376 @@
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index 7900c94848..bc97f36415 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -67,6 +67,17 @@ class SchedulerConfig:
+     In real usage, this should be set in `EngineArgs.create_engine_config`.
+     """
+ 
++    max_waiting_requests: int | None = Field(default=None, ge=0)
++    """Maximum number of requests allowed to sit in the scheduler's waiting
++    queue before the frontend applies backpressure.
++
++    When `None` (default), the waiting queue is unbounded and behavior is
++    unchanged. When set, an incoming request that would push the number of
++    in-flight (running + waiting) requests above
++    `max_num_seqs + max_waiting_requests` is rejected immediately with an
++    HTTP 429 response, before any tokenization or prefill work is done. This
++    trades a fast rejection for bounded queueing latency under burst load."""
++
+     max_num_partial_prefills: int = Field(default=1, ge=1)
+     """For chunked prefill, the maximum number of sequences that can be
+     partially prefilled concurrently."""
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 0490cbc3e4..b17e8db20d 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -522,6 +522,7 @@ class EngineArgs:
+     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
+     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
+     max_num_seqs: int | None = None
++    max_waiting_requests: int | None = None
+     max_logprobs: int = ModelConfig.max_logprobs
+     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
+     use_fp64_gumbel: bool = ModelConfig.use_fp64_gumbel
+@@ -1375,6 +1376,9 @@ class EngineArgs:
+                 "default": None,
+             },
+         )
++        scheduler_group.add_argument(
++            "--max-waiting-requests", **scheduler_kwargs["max_waiting_requests"]
++        )
+         scheduler_group.add_argument(
+             "--max-num-partial-prefills", **scheduler_kwargs["max_num_partial_prefills"]
+         )
+@@ -2034,6 +2038,7 @@ class EngineArgs:
+             runner_type=model_config.runner_type,
+             max_num_batched_tokens=self.max_num_batched_tokens,
+             max_num_seqs=self.max_num_seqs,
++            max_waiting_requests=self.max_waiting_requests,
+             max_model_len=model_config.max_model_len,
+             enable_chunked_prefill=self.enable_chunked_prefill,
+             disable_chunked_mm_input=self.disable_chunked_mm_input,
+diff --git a/vllm/engine/protocol.py b/vllm/engine/protocol.py
+index 3f83734a5b..a4e43d540e 100644
+--- a/vllm/engine/protocol.py
++++ b/vllm/engine/protocol.py
+@@ -218,6 +218,46 @@ class EngineClient(ABC):
+         """Shutdown the engine with optional timeout."""
+         ...
+ 
++    def admission_control_enabled(self) -> bool:
++        """Whether backpressure/admission control is active for this engine.
++
++        When ``False`` (the default), frontends skip all reservation work and
++        behavior is identical to an unbounded queue. Enabled by setting
++        ``--max-waiting-requests``.
++        """
++        return False
++
++    def try_reserve_request_slot(self) -> bool:
++        """Synchronously admit a request under backpressure (admission control).
++
++        Called by the frontend before any tokenization or prefill work. If a
++        slot is available it is reserved (an in-flight counter is incremented)
++        and ``True`` is returned; the caller MUST later call
++        :meth:`release_request_slot` exactly once when the request finishes.
++        If the engine's waiting queue is full, ``False`` is returned and no
++        slot is reserved.
++
++        The reservation is synchronous (no ``await`` before the counter is
++        bumped) so that a simultaneous burst of requests sees each other's
++        reservations and cannot collectively overshoot the bound. The default
++        implementation always admits, preserving the historical unbounded-queue
++        behavior.
++        """
++        return True
++
++    def release_request_slot(self) -> None:  # noqa: B027
++        """Release a slot previously reserved by :meth:`try_reserve_request_slot`."""
++        pass
++
++    def record_request_rejected(self, reason: str) -> None:  # noqa: B027
++        """Record that an incoming request was rejected before admission.
++
++        Args:
++            reason: Short machine-readable reason label (e.g. ``queue_full``)
++                used for the ``vllm:num_requests_rejected_total`` metric.
++        """
++        pass
++
+     async def scale_elastic_ep(
+         self, new_data_parallel_size: int, drain_timeout: int = 300
+     ) -> None:
+diff --git a/vllm/entrypoints/serve/utils/api_utils.py b/vllm/entrypoints/serve/utils/api_utils.py
+index 15de1b0690..095284d1ba 100644
+--- a/vllm/entrypoints/serve/utils/api_utils.py
++++ b/vllm/entrypoints/serve/utils/api_utils.py
+@@ -94,8 +94,45 @@ def with_cancellation(handler_func):
+     return wrapper
+ 
+ 
+-def decrement_server_load(request: Request):
+-    request.app.state.server_load_metrics -= 1
++# Backpressure (admission control) response. Returned before any
++# tokenization/prefill work when the engine's waiting queue is full. Shaped as
++# an OpenAI-style rate-limit error so downstream proxies (e.g. LiteLLM) parse
++# it, and carries Retry-After so clients/ingress can retry another replica.
++ENGINE_OVERLOADED_RETRY_AFTER_SECONDS = 2
++ENGINE_OVERLOADED_MESSAGE = "Engine overloaded: request queue is full"
++
++
++def engine_overloaded_response() -> JSONResponse:
++    return JSONResponse(
++        content={
++            "error": {
++                "message": ENGINE_OVERLOADED_MESSAGE,
++                "type": "rate_limit_error",
++                "code": 429,
++            }
++        },
++        status_code=429,
++        headers={"Retry-After": str(ENGINE_OVERLOADED_RETRY_AFTER_SECONDS)},
++    )
++
++
++def _run_after_response(response, callback) -> None:
++    """Schedule a zero-arg callback to run once `response` is fully sent.
++
++    Chains onto any existing background task(s) on the response so we don't
++    clobber cleanup registered elsewhere.
++    """
++    if response.background is None:
++        response.background = BackgroundTask(callback)
++    elif isinstance(response.background, BackgroundTasks):
++        response.background.add_task(callback)
++    else:
++        # Single BackgroundTask -> convert to BackgroundTasks and chain.
++        existing = response.background
++        tasks = BackgroundTasks()
++        tasks.add_task(existing.func, *existing.args, **existing.kwargs)
++        tasks.add_task(callback)
++        response.background = tasks
+ 
+ 
+ def load_aware_call(func):
+@@ -108,38 +145,55 @@ def load_aware_call(func):
+                 "raw_request required when server load tracking is enabled"
+             )
+ 
+-        if not getattr(raw_request.app.state, "enable_server_load_tracking", False):
++        app_state = raw_request.app.state
++
++        # --- Admission control (backpressure). Runs before the handler, so a
++        # rejected request does zero tokenization/prefill work and streaming
++        # requests are rejected before any SSE bytes are sent. Fully skipped
++        # (zero behavior change) when --max-waiting-requests is unset. ---
++        engine_client = getattr(app_state, "engine_client", None)
++        admission = (
++            engine_client is not None and engine_client.admission_control_enabled()
++        )
++        if admission and not engine_client.try_reserve_request_slot():
++            engine_client.record_request_rejected("queue_full")
++            return engine_overloaded_response()
++
++        load_tracking = getattr(app_state, "enable_server_load_tracking", False)
++        if load_tracking:
++            # ensure the counter exists
++            if not hasattr(app_state, "server_load_metrics"):
++                app_state.server_load_metrics = 0
++            app_state.server_load_metrics += 1
++
++        if not admission and not load_tracking:
+             return await func(*args, **kwargs)
+ 
+-        # ensure the counter exists
+-        if not hasattr(raw_request.app.state, "server_load_metrics"):
+-            raw_request.app.state.server_load_metrics = 0
++        def cleanup() -> None:
++            if admission:
++                engine_client.release_request_slot()
++            if load_tracking:
++                app_state.server_load_metrics -= 1
+ 
+-        raw_request.app.state.server_load_metrics += 1
+         try:
+             response = await func(*args, **kwargs)
++        except asyncio.CancelledError:
++            # Client disconnect / cancellation. Release the admission slot;
++            # server_load is decremented by listen_for_disconnect (preserving
++            # the pre-existing behavior), so don't touch it here.
++            if admission:
++                engine_client.release_request_slot()
++            raise
+         except Exception:
+-            raw_request.app.state.server_load_metrics -= 1
++            cleanup()
+             raise
+ 
+         if isinstance(response, (JSONResponse, StreamingResponse)):
+-            if response.background is None:
+-                response.background = BackgroundTask(decrement_server_load, raw_request)
+-            elif isinstance(response.background, BackgroundTasks):
+-                response.background.add_task(decrement_server_load, raw_request)
+-            elif isinstance(response.background, BackgroundTask):
+-                # Convert the single BackgroundTask to BackgroundTasks
+-                # and chain the decrement_server_load task to it
+-                tasks = BackgroundTasks()
+-                tasks.add_task(
+-                    response.background.func,
+-                    *response.background.args,
+-                    **response.background.kwargs,
+-                )
+-                tasks.add_task(decrement_server_load, raw_request)
+-                response.background = tasks
++            # Hold the reservation until the response (incl. the full SSE
++            # stream) has been sent, then release.
++            _run_after_response(response, cleanup)
+         else:
+-            raw_request.app.state.server_load_metrics -= 1
++            cleanup()
+ 
+         return response
+ 
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 419e15163a..0b693755e0 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -167,6 +167,21 @@ class AsyncLLM(EngineClient):
+ 
+         self._client_count = client_count
+ 
++        # Admission control (backpressure). When --max-waiting-requests is set,
++        # cap the number of in-flight (running + waiting) requests the frontend
++        # will admit at max_num_seqs + max_waiting_requests. Requests beyond
++        # that are rejected before tokenization/prefill (HTTP 429). The reserved
++        # counter is maintained synchronously by the frontend for the whole
++        # request lifetime, so a simultaneous burst cannot overshoot the bound.
++        scheduler_config = vllm_config.scheduler_config
++        max_waiting_requests = scheduler_config.max_waiting_requests
++        self.max_inflight_requests: int | None = (
++            None
++            if max_waiting_requests is None
++            else scheduler_config.max_num_seqs + max_waiting_requests
++        )
++        self._reserved_requests = 0
++
+         self.output_handler: asyncio.Task | None = None
+         try:
+             # Start output handler eagerly if we are in the asyncio eventloop.
+@@ -270,6 +285,48 @@ class AsyncLLM(EngineClient):
+         if handler is not None:
+             cancel_task_threadsafe(handler)
+ 
++    def admission_control_enabled(self) -> bool:
++        """Whether --max-waiting-requests backpressure is active."""
++        return self.max_inflight_requests is not None
++
++    def try_reserve_request_slot(self) -> bool:
++        """Reserve an admission slot, or return False if the queue is full.
++
++        Backpressure proxy: reserved slots == in-flight (running + waiting)
++        requests at the frontend. Since running is bounded by max_num_seqs,
++        capping in-flight at ``max_num_seqs + max_waiting_requests`` bounds the
++        waiting queue to at most ``max_waiting_requests``. The increment is
++        synchronous (no await) so a concurrent burst cannot overshoot the cap.
++        """
++        if self.max_inflight_requests is None:
++            return True
++        if self._reserved_requests >= self.max_inflight_requests:
++            return False
++        self._reserved_requests += 1
++        return True
++
++    def release_request_slot(self) -> None:
++        """Release a slot reserved by try_reserve_request_slot()."""
++        if self.max_inflight_requests is None:
++            return
++        # Guard against underflow if release is somehow called without a
++        # matching successful reservation.
++        if self._reserved_requests > 0:
++            self._reserved_requests -= 1
++
++    def record_request_rejected(self, reason: str) -> None:
++        """Record a request rejected before admission (backpressure)."""
++        if self.logger_manager is not None:
++            self.logger_manager.record_request_rejected(reason)
++        if self.log_requests:
++            logger.info(
++                "Rejected request: engine overloaded (reason=%s, "
++                "in_flight=%d, limit=%s).",
++                reason,
++                self._reserved_requests,
++                self.max_inflight_requests,
++            )
++
+     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+         if not hasattr(self, "_supported_tasks"):
+             # Cache the result
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index 0052a35366..8b4ce3b3d3 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -70,6 +70,9 @@ class StatLoggerBase(ABC):
+     def record_sleep_state(self, is_awake: int, level: int):  # noqa
+         pass
+ 
++    def record_request_rejected(self, reason: str):  # noqa
++        pass
++
+ 
+ def load_stat_logger_plugin_factories() -> list[StatLoggerFactory]:
+     factories: list[StatLoggerFactory] = []
+@@ -428,6 +431,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+ 
+         labelnames = ["model_name", "engine"]
+         model_name = vllm_config.model_config.served_model_name
++        self.model_name = model_name
+         max_model_len = vllm_config.model_config.max_model_len
+ 
+         self.per_engine_labelvalues: dict[int, list[object]] = {
+@@ -539,6 +543,23 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+                 counter_corrupted_requests, per_engine_labelvalues
+             )
+ 
++        # Requests rejected before admission (frontend backpressure). This is
++        # a frontend-global event (not attributable to a single scheduler), so
++        # it is labeled by model_name + reason only, and incremented directly
++        # via record_request_rejected() rather than from scheduler stats. Only
++        # created when --max-waiting-requests is set, so there is no behavior
++        # change (no new metric series) when the feature is unused.
++        self.counter_num_requests_rejected: Counter | None = None
++        if vllm_config.scheduler_config.max_waiting_requests is not None:
++            self.counter_num_requests_rejected = self._counter_cls(
++                name="vllm:num_requests_rejected",
++                documentation=(
++                    "Number of requests rejected before admission due to engine "
++                    "backpressure (e.g. the waiting queue is full)."
++                ),
++                labelnames=["model_name", "reason"],
++            )
++
+         counter_prefix_cache_queries = self._counter_cls(
+             name="vllm:prefix_cache_queries",
+             documentation=(
+@@ -1235,6 +1256,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+             )
+             self.gauge_engine_sleep_state["awake"][engine_idx].set(awake)
+ 
++    def record_request_rejected(self, reason: str):
++        if self.counter_num_requests_rejected is not None:
++            self.counter_num_requests_rejected.labels(self.model_name, reason).inc()
++
+     def log_engine_initialized(self):
+         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
+ 
+@@ -1351,6 +1376,10 @@ class StatLoggerManager:
+         for logger in self.stat_loggers:
+             logger.record_sleep_state(sleep, level)
+ 
++    def record_request_rejected(self, reason: str):
++        for logger in self.stat_loggers:
++            logger.record_request_rejected(reason)
++
+     def log(self):
+         for logger in self.stat_loggers:
+             logger.log()
