@@ -95,18 +95,24 @@ def with_cancellation(handler_func):
 
 
 # Backpressure (admission control) response. Returned before any
-# tokenization/prefill work when the engine's waiting queue is full. Shaped as
-# an OpenAI-style rate-limit error so downstream proxies (e.g. LiteLLM) parse
+# tokenization/prefill work when the engine is overloaded. Shaped as an
+# OpenAI-style rate-limit error so downstream proxies (e.g. LiteLLM) parse
 # it, and carries Retry-After so clients/ingress can retry another replica.
 ENGINE_OVERLOADED_RETRY_AFTER_SECONDS = 2
-ENGINE_OVERLOADED_MESSAGE = "Engine overloaded: request queue is full"
+ENGINE_OVERLOADED_MESSAGES = {
+    "queue_full": "Engine overloaded: request queue is full",
+    "kv_pressure": "Engine overloaded: KV cache pressure is too high",
+}
+ENGINE_OVERLOADED_DEFAULT_MESSAGE = "Engine overloaded"
 
 
-def engine_overloaded_response() -> JSONResponse:
+def engine_overloaded_response(reason: str) -> JSONResponse:
     return JSONResponse(
         content={
             "error": {
-                "message": ENGINE_OVERLOADED_MESSAGE,
+                "message": ENGINE_OVERLOADED_MESSAGES.get(
+                    reason, ENGINE_OVERLOADED_DEFAULT_MESSAGE
+                ),
                 "type": "rate_limit_error",
                 "code": 429,
             }
@@ -155,9 +161,9 @@ def load_aware_call(func):
         admission = (
             engine_client is not None and engine_client.admission_control_enabled()
         )
-        if admission and not engine_client.try_reserve_request_slot():
-            engine_client.record_request_rejected("queue_full")
-            return engine_overloaded_response()
+        if admission and (reason := engine_client.try_reserve_request_slot()):
+            engine_client.record_request_rejected(reason)
+            return engine_overloaded_response(reason)
 
         load_tracking = getattr(app_state, "enable_server_load_tracking", False)
         if load_tracking:

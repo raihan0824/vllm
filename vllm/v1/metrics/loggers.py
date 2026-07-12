@@ -547,10 +547,14 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # a frontend-global event (not attributable to a single scheduler), so
         # it is labeled by model_name + reason only, and incremented directly
         # via record_request_rejected() rather than from scheduler stats. Only
-        # created when --max-waiting-requests is set, so there is no behavior
-        # change (no new metric series) when the feature is unused.
+        # created when admission control is enabled (--max-waiting-requests /
+        # --admission-max-kv-usage), so there is no behavior change (no new
+        # metric series) when the feature is unused.
         self.counter_num_requests_rejected: Counter | None = None
-        if vllm_config.scheduler_config.max_waiting_requests is not None:
+        if (
+            vllm_config.scheduler_config.max_waiting_requests is not None
+            or vllm_config.scheduler_config.admission_max_kv_usage is not None
+        ):
             self.counter_num_requests_rejected = self._counter_cls(
                 name="vllm:num_requests_rejected",
                 documentation=(

@@ -223,19 +223,20 @@ class EngineClient(ABC):
 
         When ``False`` (the default), frontends skip all reservation work and
         behavior is identical to an unbounded queue. Enabled by setting
-        ``--max-waiting-requests``.
+        ``--max-waiting-requests`` and/or ``--admission-max-kv-usage``.
         """
         return False
 
-    def try_reserve_request_slot(self) -> bool:
+    def try_reserve_request_slot(self) -> str | None:
         """Synchronously admit a request under backpressure (admission control).
 
-        Called by the frontend before any tokenization or prefill work. If a
-        slot is available it is reserved (an in-flight counter is incremented)
-        and ``True`` is returned; the caller MUST later call
-        :meth:`release_request_slot` exactly once when the request finishes.
-        If the engine's waiting queue is full, ``False`` is returned and no
-        slot is reserved.
+        Called by the frontend before any tokenization or prefill work. If
+        the engine can accept the request, a slot is reserved (an in-flight
+        counter is incremented) and ``None`` is returned; the caller MUST
+        later call :meth:`release_request_slot` exactly once when the request
+        finishes. If the engine is overloaded, a short machine-readable
+        rejection reason (e.g. ``queue_full``, ``kv_pressure``) is returned
+        and no slot is reserved.
 
         The reservation is synchronous (no ``await`` before the counter is
         bumped) so that a simultaneous burst of requests sees each other's
@@ -243,7 +244,7 @@ class EngineClient(ABC):
         implementation always admits, preserving the historical unbounded-queue
         behavior.
         """
-        return True
+        return None
 
     def release_request_slot(self) -> None:  # noqa: B027
         """Release a slot previously reserved by :meth:`try_reserve_request_slot`."""

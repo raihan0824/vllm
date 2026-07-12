@@ -82,6 +82,18 @@ class SchedulerConfig:
     assumed. This trades a fast rejection for bounded queueing latency under
     burst load."""
 
+    admission_max_kv_usage: float | None = Field(default=None, gt=0, le=1)
+    """KV-cache usage fraction (0, 1] above which new requests are rejected
+    with HTTP 429 backpressure.
+
+    When `None` (default), KV pressure does not affect admission. When set,
+    an incoming request is rejected before any tokenization or prefill work
+    while the engine's reported KV-cache usage is at or above this threshold.
+    High KV usage is a leading indicator of slow prefill (TTFT) for newly
+    admitted requests and of preemption storms; rejecting early lets an
+    upstream load balancer retry the request on a less-loaded replica.
+    Can be combined with `max_waiting_requests`."""
+
     max_num_partial_prefills: int = Field(default=1, ge=1)
     """For chunked prefill, the maximum number of sequences that can be
     partially prefilled concurrently."""
