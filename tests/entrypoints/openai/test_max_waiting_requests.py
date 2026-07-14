@@ -84,7 +84,7 @@ def make_client(server: RemoteOpenAIServer, n_conns: int) -> httpx.AsyncClient:
 
 def assert_overloaded_body(response: httpx.Response) -> None:
     """Validate the OpenAI-shaped 429 error body + Retry-After header."""
-    assert response.headers.get("Retry-After") == "2"
+    assert response.headers.get("Retry-After") == "0"
     body = response.json()
     assert set(body.keys()) == {"error"}
     err = body["error"]
@@ -172,7 +172,7 @@ async def test_streaming_rejected_before_any_sse_bytes(bounded_server):
                 "POST", CHAT_URL, json=chat_payload(max_tokens=64, stream=True)
             ) as resp:
                 assert resp.status_code == 429
-                assert resp.headers.get("Retry-After") == "2"
+                assert resp.headers.get("Retry-After") == "0"
                 body = await resp.aread()
                 # The body is a single JSON error, NOT an SSE `data:` frame.
                 assert not body.lstrip().startswith(b"data:")

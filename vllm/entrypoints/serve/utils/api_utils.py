@@ -98,7 +98,13 @@ def with_cancellation(handler_func):
 # tokenization/prefill work when the engine is overloaded. Shaped as an
 # OpenAI-style rate-limit error so downstream proxies (e.g. LiteLLM) parse
 # it, and carries Retry-After so clients/ingress can retry another replica.
-ENGINE_OVERLOADED_RETRY_AFTER_SECONDS = 2
+#
+# Retry-After is 0 (retry immediately) on purpose: in-path proxies honor this
+# header literally while an upstream gateway's TTFT clock keeps running, so
+# any positive value converts retried-then-served requests into apparent
+# gateway timeouts. Load balancers retry on a different replica in
+# milliseconds; a backoff hint is counterproductive here.
+ENGINE_OVERLOADED_RETRY_AFTER_SECONDS = 0
 ENGINE_OVERLOADED_MESSAGES = {
     "queue_full": "Engine overloaded: request queue is full",
     "kv_pressure": "Engine overloaded: KV cache pressure is too high",
