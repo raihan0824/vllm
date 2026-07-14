@@ -26,11 +26,13 @@ def make_controller(
     max_num_seqs: int,
     max_waiting_requests: int | None = None,
     max_kv_usage: float | None = None,
+    max_prompt_tokens: int | None = None,
 ) -> AdmissionController:
     return AdmissionController(
         max_num_seqs=max_num_seqs,
         max_waiting_requests=max_waiting_requests,
         max_kv_usage=max_kv_usage,
+        max_prompt_tokens=max_prompt_tokens,
     )
 
 
@@ -195,3 +197,61 @@ def test_combined_gates_recover():
     assert c.try_reserve() == "kv_pressure"
     c.update_stats(0, make_stats(running=4, waiting=0, kv_usage=0.70))
     assert c.try_reserve() is None
+
+
+# ---------------------------------------------------------------------------
+# Long-prompt gate (--admission-max-prompt-tokens)
+# ---------------------------------------------------------------------------
+
+
+def fill(controller: AdmissionController, n: int) -> None:
+    for _ in range(n):
+        assert controller.try_reserve() is None
+
+
+def test_long_prompt_rejected_when_busy():
+    c = make_controller(max_num_seqs=8, max_prompt_tokens=25000)
+    fill(c, 4)  # reserved=4, capacity=8 -> busy (>= half)
+    assert c.is_busy()
+    assert c.should_reject_long_prompt(25001)
+    assert not c.should_reject_long_prompt(25000)  # boundary: <= threshold OK
+
+
+def test_long_prompt_served_when_idle():
+    c = make_controller(max_num_seqs=8, max_prompt_tokens=25000)
+    fill(c, 3)  # reserved=3, capacity=8 -> not busy
+    assert not c.is_busy()
+    assert not c.should_reject_long_prompt(100_000)
+
+
+def test_long_prompt_gate_disabled_by_default():
+    c = make_controller(max_num_seqs=8, max_waiting_requests=2)
+    fill(c, 8)
+    assert not c.should_reject_long_prompt(1_000_000)
+
+
+def test_long_prompt_busy_tracks_capacity_estimate():
+    # Engine backlogged at 4 running (capacity=4): busy from reserved>=2.
+    c = make_controller(max_num_seqs=64, max_prompt_tokens=25000)
+    c.update_stats(0, make_stats(running=4, waiting=3))
+    fill(c, 2)
+    assert c.is_busy()
+    assert c.should_reject_long_prompt(30_000)
+
+
+def test_long_prompt_gate_recovers_after_release():
+    c = make_controller(max_num_seqs=8, max_prompt_tokens=25000)
+    fill(c, 4)
+    assert c.should_reject_long_prompt(30_000)
+    c.release()  # reserved=3 -> not busy
+    assert not c.should_reject_long_prompt(30_000)
+
+
+def test_long_prompt_gate_alone_enables_controller_reserve_flow():
+    # Only the prompt gate configured: reserve/release must still work
+    # (no queue bound -> never queue_full), and busy state derives from it.
+    c = make_controller(max_num_seqs=4, max_prompt_tokens=25000)
+    results = [c.try_reserve() for _ in range(10)]
+    assert results.count(None) == 10  # no queue gate -> all admitted
+    assert c.is_busy()
+    assert c.should_reject_long_prompt(25001)

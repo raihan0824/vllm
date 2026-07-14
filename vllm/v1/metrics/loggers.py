@@ -554,6 +554,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         if (
             vllm_config.scheduler_config.max_waiting_requests is not None
             or vllm_config.scheduler_config.admission_max_kv_usage is not None
+            or vllm_config.scheduler_config.admission_max_prompt_tokens is not None
         ):
             self.counter_num_requests_rejected = self._counter_cls(
                 name="vllm:num_requests_rejected",

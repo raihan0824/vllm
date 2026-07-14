@@ -210,6 +210,62 @@ async def test_rejected_requests_do_zero_prefill(bounded_server):
     assert after - before == num_429
 
 
+@pytest.fixture(scope="module")
+def long_prompt_gated_server():
+    """Server with only the long-prompt gate (--admission-max-prompt-tokens)."""
+    args = BASE_ARGS + ["--admission-max-prompt-tokens", "64"]
+    with RemoteOpenAIServer(MODEL_NAME, args) as server:
+        yield server
+
+
+def long_prompt_payload(n_words: int, max_tokens: int, stream: bool = False) -> dict:
+    payload = chat_payload(max_tokens=max_tokens, stream=stream)
+    payload["messages"] = [{"role": "user", "content": "word " * n_words}]
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_long_prompt_served_when_idle(long_prompt_gated_server):
+    """A prompt over the threshold is served normally on an idle engine."""
+    async with make_client(long_prompt_gated_server, n_conns=2) as client:
+        resp = await client.post(
+            CHAT_URL, json=long_prompt_payload(n_words=200, max_tokens=8)
+        )
+        assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_long_prompt_rejected_when_busy(long_prompt_gated_server):
+    """Over-threshold prompts get 429 while the engine is busy; short ones pass."""
+    async with make_client(long_prompt_gated_server, n_conns=8) as client:
+        # Saturate the engine (MAX_NUM_SEQS slots) with slow short requests.
+        occupiers = [
+            asyncio.create_task(
+                client.post(CHAT_URL, json=chat_payload(max_tokens=SLOW_MAX_TOKENS))
+            )
+            for _ in range(MAX_NUM_SEQS)
+        ]
+        try:
+            await asyncio.sleep(1.5)
+
+            # Long prompt while busy -> 429 rate_limit_error, no SSE bytes.
+            resp = await client.post(
+                CHAT_URL, json=long_prompt_payload(n_words=200, max_tokens=8)
+            )
+            assert resp.status_code == 429, resp.text
+            err = resp.json()["error"]
+            assert err["type"] == "rate_limit_error"
+            assert err["code"] == 429
+
+            # Short prompt while busy -> still admitted (no queue gate here).
+            resp = await client.post(CHAT_URL, json=chat_payload(max_tokens=8))
+            assert resp.status_code == 200, resp.text
+        finally:
+            for task in occupiers:
+                task.cancel()
+            await asyncio.gather(*occupiers, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_default_unbounded_is_unchanged(unbounded_server):
     """Test 5: regression. Without the flag, a burst produces zero 429s."""

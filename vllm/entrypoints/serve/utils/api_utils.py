@@ -122,6 +122,33 @@ def engine_overloaded_response(reason: str) -> JSONResponse:
     )
 
 
+def check_prompt_admission(engine_client, num_prompt_tokens: int):
+    """Length-based admission control (--admission-max-prompt-tokens).
+
+    Called by serving handlers post-tokenization, before any prefill work
+    (and, for streaming, before any SSE bytes are sent). Returns an
+    OpenAI-shaped 429 ErrorResponse when the engine rejects the prompt,
+    None otherwise. Fails open when the engine client does not implement
+    length-based admission.
+    """
+    from http import HTTPStatus
+
+    from vllm.entrypoints.serve.utils.error_response import create_error_response
+
+    try_admit = getattr(engine_client, "try_admit_prompt", None)
+    if try_admit is None:
+        return None
+    reason = try_admit(num_prompt_tokens)
+    if reason is None:
+        return None
+    engine_client.record_request_rejected(reason)
+    return create_error_response(
+        "Engine overloaded: long-prompt capacity exhausted, retry later",
+        err_type="rate_limit_error",
+        status_code=HTTPStatus.TOO_MANY_REQUESTS,
+    )
+
+
 def _run_after_response(response, callback) -> None:
     """Schedule a zero-arg callback to run once `response` is fully sent.
 

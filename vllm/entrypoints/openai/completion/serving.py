@@ -141,6 +141,19 @@ class OpenAIServingCompletion(OpenAIServing):
 
         engine_inputs = result
 
+        # Length-based admission control (--admission-max-prompt-tokens):
+        # reject before any prefill work / SSE bytes when the engine is busy.
+        from vllm.entrypoints.serve.utils.api_utils import check_prompt_admission
+
+        max_prompt_len = max(
+            (self._extract_prompt_len(engine_input) or 0)
+            for engine_input in engine_inputs
+        )
+        if admission_error := check_prompt_admission(
+            self.engine_client, max_prompt_len
+        ):
+            return admission_error
+
         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
         created_time = int(time.time())
 

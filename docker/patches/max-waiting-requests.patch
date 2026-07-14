@@ -1,8 +1,8 @@
 diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
-index 7900c94848..de306eb03a 100644
+index 7900c94848..8716266db5 100644
 --- a/vllm/config/scheduler.py
 +++ b/vllm/config/scheduler.py
-@@ -67,6 +67,33 @@ class SchedulerConfig:
+@@ -67,6 +67,45 @@ class SchedulerConfig:
      In real usage, this should be set in `EngineArgs.create_engine_config`.
      """
  
@@ -33,23 +33,36 @@ index 7900c94848..de306eb03a 100644
 +    upstream load balancer retry the request on a less-loaded replica.
 +    Can be combined with `max_waiting_requests`."""
 +
++    admission_max_prompt_tokens: int | None = Field(default=None, ge=1)
++    """Maximum prompt length (in tokens) admitted while the engine is busy.
++
++    When `None` (default), prompt length does not affect admission. When set,
++    a request whose prompt exceeds this many tokens is rejected with HTTP 429
++    if the engine is busy (in-flight requests at or above half its estimated
++    serving capacity); when the engine has headroom, long prompts are served
++    normally. Rationale: past a certain prompt length, prefill under load
++    cannot complete within upstream TTFT deadlines, so such requests would
++    fail anyway — a fast, retryable rejection is strictly better. The check
++    runs after tokenization but before any prefill work."""
++
      max_num_partial_prefills: int = Field(default=1, ge=1)
      """For chunked prefill, the maximum number of sequences that can be
      partially prefilled concurrently."""
 diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
-index 0490cbc3e4..c20f893ce8 100644
+index 0490cbc3e4..d1b66be0a6 100644
 --- a/vllm/engine/arg_utils.py
 +++ b/vllm/engine/arg_utils.py
-@@ -522,6 +522,8 @@ class EngineArgs:
+@@ -522,6 +522,9 @@ class EngineArgs:
      max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
      long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
      max_num_seqs: int | None = None
 +    max_waiting_requests: int | None = None
 +    admission_max_kv_usage: float | None = None
++    admission_max_prompt_tokens: int | None = None
      max_logprobs: int = ModelConfig.max_logprobs
      logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
      use_fp64_gumbel: bool = ModelConfig.use_fp64_gumbel
-@@ -1375,6 +1377,12 @@ class EngineArgs:
+@@ -1375,6 +1378,16 @@ class EngineArgs:
                  "default": None,
              },
          )
@@ -59,23 +72,28 @@ index 0490cbc3e4..c20f893ce8 100644
 +        scheduler_group.add_argument(
 +            "--admission-max-kv-usage", **scheduler_kwargs["admission_max_kv_usage"]
 +        )
++        scheduler_group.add_argument(
++            "--admission-max-prompt-tokens",
++            **scheduler_kwargs["admission_max_prompt_tokens"],
++        )
          scheduler_group.add_argument(
              "--max-num-partial-prefills", **scheduler_kwargs["max_num_partial_prefills"]
          )
-@@ -2034,6 +2042,8 @@ class EngineArgs:
+@@ -2034,6 +2047,9 @@ class EngineArgs:
              runner_type=model_config.runner_type,
              max_num_batched_tokens=self.max_num_batched_tokens,
              max_num_seqs=self.max_num_seqs,
 +            max_waiting_requests=self.max_waiting_requests,
 +            admission_max_kv_usage=self.admission_max_kv_usage,
++            admission_max_prompt_tokens=self.admission_max_prompt_tokens,
              max_model_len=model_config.max_model_len,
              enable_chunked_prefill=self.enable_chunked_prefill,
              disable_chunked_mm_input=self.disable_chunked_mm_input,
 diff --git a/vllm/engine/protocol.py b/vllm/engine/protocol.py
-index 3f83734a5b..4c3bea7778 100644
+index 3f83734a5b..82b0b7d3b6 100644
 --- a/vllm/engine/protocol.py
 +++ b/vllm/engine/protocol.py
-@@ -218,6 +218,47 @@ class EngineClient(ABC):
+@@ -218,6 +218,58 @@ class EngineClient(ABC):
          """Shutdown the engine with optional timeout."""
          ...
  
@@ -111,6 +129,17 @@ index 3f83734a5b..4c3bea7778 100644
 +        """Release a slot previously reserved by :meth:`try_reserve_request_slot`."""
 +        pass
 +
++    def try_admit_prompt(self, num_prompt_tokens: int) -> str | None:
++        """Length-based admission check (admission control), post-tokenization.
++
++        Called by the serving layer once the prompt token count is known,
++        before any prefill work. Returns ``None`` to proceed, or a short
++        rejection reason (e.g. ``long_prompt``) to reject with HTTP 429.
++        Unlike :meth:`try_reserve_request_slot`, this neither reserves nor
++        releases anything. The default implementation always admits.
++        """
++        return None
++
 +    def record_request_rejected(self, reason: str) -> None:  # noqa: B027
 +        """Record that an incoming request was rejected before admission.
 +
@@ -123,11 +152,59 @@ index 3f83734a5b..4c3bea7778 100644
      async def scale_elastic_ep(
          self, new_data_parallel_size: int, drain_timeout: int = 300
      ) -> None:
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 9dd9a34162..059535d84c 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -253,6 +253,19 @@ class OpenAIServingChat(OpenAIServing):
+ 
+         conversation, engine_inputs = result
+ 
++        # Length-based admission control (--admission-max-prompt-tokens):
++        # reject before any prefill work / SSE bytes when the engine is busy.
++        from vllm.entrypoints.serve.utils.api_utils import check_prompt_admission
++
++        max_prompt_len = max(
++            (self._extract_prompt_len(engine_input) or 0)
++            for engine_input in engine_inputs
++        )
++        if admission_error := check_prompt_admission(
++            self.engine_client, max_prompt_len
++        ):
++            return admission_error
++
+         request_id = (
+             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+         )
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+index ed85323d80..732e38394e 100644
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -141,6 +141,19 @@ class OpenAIServingCompletion(OpenAIServing):
+ 
+         engine_inputs = result
+ 
++        # Length-based admission control (--admission-max-prompt-tokens):
++        # reject before any prefill work / SSE bytes when the engine is busy.
++        from vllm.entrypoints.serve.utils.api_utils import check_prompt_admission
++
++        max_prompt_len = max(
++            (self._extract_prompt_len(engine_input) or 0)
++            for engine_input in engine_inputs
++        )
++        if admission_error := check_prompt_admission(
++            self.engine_client, max_prompt_len
++        ):
++            return admission_error
++
+         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
+         created_time = int(time.time())
+ 
 diff --git a/vllm/entrypoints/serve/utils/api_utils.py b/vllm/entrypoints/serve/utils/api_utils.py
-index 15de1b0690..825bf40beb 100644
+index 15de1b0690..5577b5e06b 100644
 --- a/vllm/entrypoints/serve/utils/api_utils.py
 +++ b/vllm/entrypoints/serve/utils/api_utils.py
-@@ -94,8 +94,51 @@ def with_cancellation(handler_func):
+@@ -94,8 +94,78 @@ def with_cancellation(handler_func):
      return wrapper
  
  
@@ -161,6 +238,33 @@ index 15de1b0690..825bf40beb 100644
 +    )
 +
 +
++def check_prompt_admission(engine_client, num_prompt_tokens: int):
++    """Length-based admission control (--admission-max-prompt-tokens).
++
++    Called by serving handlers post-tokenization, before any prefill work
++    (and, for streaming, before any SSE bytes are sent). Returns an
++    OpenAI-shaped 429 ErrorResponse when the engine rejects the prompt,
++    None otherwise. Fails open when the engine client does not implement
++    length-based admission.
++    """
++    from http import HTTPStatus
++
++    from vllm.entrypoints.serve.utils.error_response import create_error_response
++
++    try_admit = getattr(engine_client, "try_admit_prompt", None)
++    if try_admit is None:
++        return None
++    reason = try_admit(num_prompt_tokens)
++    if reason is None:
++        return None
++    engine_client.record_request_rejected(reason)
++    return create_error_response(
++        "Engine overloaded: long-prompt capacity exhausted, retry later",
++        err_type="rate_limit_error",
++        status_code=HTTPStatus.TOO_MANY_REQUESTS,
++    )
++
++
 +def _run_after_response(response, callback) -> None:
 +    """Schedule a zero-arg callback to run once `response` is fully sent.
 +
@@ -181,7 +285,7 @@ index 15de1b0690..825bf40beb 100644
  
  
  def load_aware_call(func):
-@@ -108,38 +151,55 @@ def load_aware_call(func):
+@@ -108,38 +178,55 @@ def load_aware_call(func):
                  "raw_request required when server load tracking is enabled"
              )
  
@@ -260,7 +364,7 @@ index 15de1b0690..825bf40beb 100644
          return response
  
 diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
-index 419e15163a..f9b888657f 100644
+index 419e15163a..bd8b2970fc 100644
 --- a/vllm/v1/engine/async_llm.py
 +++ b/vllm/v1/engine/async_llm.py
 @@ -50,7 +50,7 @@ from vllm.v1.metrics.loggers import (
@@ -272,7 +376,7 @@ index 419e15163a..f9b888657f 100644
  
  logger = init_logger(__name__)
  
-@@ -67,6 +67,96 @@ class InputStreamError(Exception):
+@@ -67,6 +67,122 @@ class InputStreamError(Exception):
          super().__init__(str(cause))
  
  
@@ -299,6 +403,13 @@ index 419e15163a..f9b888657f 100644
 +      DP engines the *minimum* usage across engines is compared, since the
 +      DP router steers new requests to the least-loaded engine. Fails open
 +      before the first stats arrive (cold start).
++
++    - ``max_prompt_tokens``: rejects prompts longer than the threshold while
++      the engine is busy (in-flight at or above half the estimated capacity).
++      Past a certain length, prefill under load cannot complete within
++      upstream TTFT deadlines, so such requests would fail anyway; when the
++      engine has headroom they are served normally. Checked by the serving
++      layer after tokenization, before any prefill work.
 +    """
 +
 +    def __init__(
@@ -306,10 +417,12 @@ index 419e15163a..f9b888657f 100644
 +        max_num_seqs: int,
 +        max_waiting_requests: int | None,
 +        max_kv_usage: float | None,
++        max_prompt_tokens: int | None = None,
 +    ):
 +        self.max_num_seqs = max_num_seqs
 +        self.max_waiting_requests = max_waiting_requests
 +        self.max_kv_usage = max_kv_usage
++        self.max_prompt_tokens = max_prompt_tokens
 +        self.reserved = 0
 +        # engine_idx -> (num_running, num_waiting incl. deferred, kv_usage)
 +        self._engine_stats: dict[int, tuple[int, int, float]] = {}
@@ -365,11 +478,28 @@ index 419e15163a..f9b888657f 100644
 +        if self.reserved > 0:
 +            self.reserved -= 1
 +
++    def is_busy(self) -> bool:
++        """Whether in-flight requests are at or above half the estimated
++        serving capacity (the long-prompt gate's activation condition)."""
++        return 2 * self.reserved >= self.capacity_estimate()
++
++    def should_reject_long_prompt(self, num_prompt_tokens: int) -> bool:
++        """Whether a prompt of this length should be rejected right now.
++
++        Fires only when both hold: the prompt exceeds ``max_prompt_tokens``
++        AND the engine is busy. An idle engine serves long prompts normally.
++        """
++        if self.max_prompt_tokens is None:
++            return False
++        if num_prompt_tokens <= self.max_prompt_tokens:
++            return False
++        return self.is_busy()
++
 +
  class AsyncLLM(EngineClient):
      """An asynchronous wrapper for the vLLM engine."""
  
-@@ -129,6 +219,28 @@ class AsyncLLM(EngineClient):
+@@ -129,6 +245,34 @@ class AsyncLLM(EngineClient):
                  "enabling logging without default stat loggers."
              )
  
@@ -380,12 +510,18 @@ index 419e15163a..f9b888657f 100644
 +        scheduler_config = vllm_config.scheduler_config
 +        max_waiting_requests = scheduler_config.max_waiting_requests
 +        admission_max_kv_usage = scheduler_config.admission_max_kv_usage
++        admission_max_prompt_tokens = scheduler_config.admission_max_prompt_tokens
 +        self.admission_controller: AdmissionController | None = None
-+        if max_waiting_requests is not None or admission_max_kv_usage is not None:
++        if (
++            max_waiting_requests is not None
++            or admission_max_kv_usage is not None
++            or admission_max_prompt_tokens is not None
++        ):
 +            self.admission_controller = AdmissionController(
 +                max_num_seqs=scheduler_config.max_num_seqs,
 +                max_waiting_requests=max_waiting_requests,
 +                max_kv_usage=admission_max_kv_usage,
++                max_prompt_tokens=admission_max_prompt_tokens,
 +            )
 +            if not self.log_stats:
 +                self.log_stats = True
@@ -398,7 +534,7 @@ index 419e15163a..f9b888657f 100644
          self.renderer = renderer = renderer_from_config(self.vllm_config)
  
          # Convert EngineInput --> EngineCoreRequest.
-@@ -270,6 +382,42 @@ class AsyncLLM(EngineClient):
+@@ -270,6 +414,55 @@ class AsyncLLM(EngineClient):
          if handler is not None:
              cancel_task_threadsafe(handler)
  
@@ -424,6 +560,19 @@ index 419e15163a..f9b888657f 100644
 +        if self.admission_controller is not None:
 +            self.admission_controller.release()
 +
++    def try_admit_prompt(self, num_prompt_tokens: int) -> str | None:
++        """Length-based admission check, run post-tokenization.
++
++        Returns None if the prompt may proceed, or a rejection reason
++        ("long_prompt") when the prompt exceeds --admission-max-prompt-tokens
++        while the engine is busy. Does not reserve or release anything.
++        """
++        if self.admission_controller is None:
++            return None
++        if self.admission_controller.should_reject_long_prompt(num_prompt_tokens):
++            return "long_prompt"
++        return None
++
 +    def record_request_rejected(self, reason: str) -> None:
 +        """Record a request rejected before admission (backpressure)."""
 +        if self.logger_manager is not None:
@@ -441,7 +590,7 @@ index 419e15163a..f9b888657f 100644
      async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
          if not hasattr(self, "_supported_tasks"):
              # Cache the result
-@@ -652,6 +800,7 @@ class AsyncLLM(EngineClient):
+@@ -652,6 +845,7 @@ class AsyncLLM(EngineClient):
          logger_ref = self._logger_ref
          renderer = self.renderer
          chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
@@ -449,7 +598,7 @@ index 419e15163a..f9b888657f 100644
  
          async def output_handler():
              try:
-@@ -690,6 +839,16 @@ class AsyncLLM(EngineClient):
+@@ -690,6 +884,16 @@ class AsyncLLM(EngineClient):
  
                      output_processor.update_scheduler_stats(outputs.scheduler_stats)
  
@@ -467,7 +616,7 @@ index 419e15163a..f9b888657f 100644
                      # TODO(rob): make into a coroutine and launch it in
                      # background thread once Prometheus overhead is non-trivial.
 diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
-index 0052a35366..afee59171d 100644
+index 0052a35366..5aaf84fd5f 100644
 --- a/vllm/v1/metrics/loggers.py
 +++ b/vllm/v1/metrics/loggers.py
 @@ -70,6 +70,9 @@ class StatLoggerBase(ABC):
@@ -488,7 +637,7 @@ index 0052a35366..afee59171d 100644
          max_model_len = vllm_config.model_config.max_model_len
  
          self.per_engine_labelvalues: dict[int, list[object]] = {
-@@ -539,6 +543,27 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+@@ -539,6 +543,28 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                  counter_corrupted_requests, per_engine_labelvalues
              )
  
@@ -503,6 +652,7 @@ index 0052a35366..afee59171d 100644
 +        if (
 +            vllm_config.scheduler_config.max_waiting_requests is not None
 +            or vllm_config.scheduler_config.admission_max_kv_usage is not None
++            or vllm_config.scheduler_config.admission_max_prompt_tokens is not None
 +        ):
 +            self.counter_num_requests_rejected = self._counter_cls(
 +                name="vllm:num_requests_rejected",
@@ -516,7 +666,7 @@ index 0052a35366..afee59171d 100644
          counter_prefix_cache_queries = self._counter_cls(
              name="vllm:prefix_cache_queries",
              documentation=(
-@@ -1235,6 +1260,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+@@ -1235,6 +1261,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
              )
              self.gauge_engine_sleep_state["awake"][engine_idx].set(awake)
  
@@ -527,7 +677,7 @@ index 0052a35366..afee59171d 100644
      def log_engine_initialized(self):
          self.log_metrics_info("cache_config", self.vllm_config.cache_config)
  
-@@ -1351,6 +1380,10 @@ class StatLoggerManager:
+@@ -1351,6 +1381,10 @@ class StatLoggerManager:
          for logger in self.stat_loggers:
              logger.record_sleep_state(sleep, level)
  

@@ -94,6 +94,18 @@ class SchedulerConfig:
     upstream load balancer retry the request on a less-loaded replica.
     Can be combined with `max_waiting_requests`."""
 
+    admission_max_prompt_tokens: int | None = Field(default=None, ge=1)
+    """Maximum prompt length (in tokens) admitted while the engine is busy.
+
+    When `None` (default), prompt length does not affect admission. When set,
+    a request whose prompt exceeds this many tokens is rejected with HTTP 429
+    if the engine is busy (in-flight requests at or above half its estimated
+    serving capacity); when the engine has headroom, long prompts are served
+    normally. Rationale: past a certain prompt length, prefill under load
+    cannot complete within upstream TTFT deadlines, so such requests would
+    fail anyway — a fast, retryable rejection is strictly better. The check
+    runs after tokenization but before any prefill work."""
+
     max_num_partial_prefills: int = Field(default=1, ge=1)
     """For chunked prefill, the maximum number of sequences that can be
     partially prefilled concurrently."""

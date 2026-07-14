@@ -90,6 +90,13 @@ class AdmissionController:
       DP engines the *minimum* usage across engines is compared, since the
       DP router steers new requests to the least-loaded engine. Fails open
       before the first stats arrive (cold start).
+
+    - ``max_prompt_tokens``: rejects prompts longer than the threshold while
+      the engine is busy (in-flight at or above half the estimated capacity).
+      Past a certain length, prefill under load cannot complete within
+      upstream TTFT deadlines, so such requests would fail anyway; when the
+      engine has headroom they are served normally. Checked by the serving
+      layer after tokenization, before any prefill work.
     """
 
     def __init__(
@@ -97,10 +104,12 @@ class AdmissionController:
         max_num_seqs: int,
         max_waiting_requests: int | None,
         max_kv_usage: float | None,
+        max_prompt_tokens: int | None = None,
     ):
         self.max_num_seqs = max_num_seqs
         self.max_waiting_requests = max_waiting_requests
         self.max_kv_usage = max_kv_usage
+        self.max_prompt_tokens = max_prompt_tokens
         self.reserved = 0
         # engine_idx -> (num_running, num_waiting incl. deferred, kv_usage)
         self._engine_stats: dict[int, tuple[int, int, float]] = {}
@@ -155,6 +164,23 @@ class AdmissionController:
         # matching successful reservation.
         if self.reserved > 0:
             self.reserved -= 1
+
+    def is_busy(self) -> bool:
+        """Whether in-flight requests are at or above half the estimated
+        serving capacity (the long-prompt gate's activation condition)."""
+        return 2 * self.reserved >= self.capacity_estimate()
+
+    def should_reject_long_prompt(self, num_prompt_tokens: int) -> bool:
+        """Whether a prompt of this length should be rejected right now.
+
+        Fires only when both hold: the prompt exceeds ``max_prompt_tokens``
+        AND the engine is busy. An idle engine serves long prompts normally.
+        """
+        if self.max_prompt_tokens is None:
+            return False
+        if num_prompt_tokens <= self.max_prompt_tokens:
+            return False
+        return self.is_busy()
 
 
 class AsyncLLM(EngineClient):
@@ -226,12 +252,18 @@ class AsyncLLM(EngineClient):
         scheduler_config = vllm_config.scheduler_config
         max_waiting_requests = scheduler_config.max_waiting_requests
         admission_max_kv_usage = scheduler_config.admission_max_kv_usage
+        admission_max_prompt_tokens = scheduler_config.admission_max_prompt_tokens
         self.admission_controller: AdmissionController | None = None
-        if max_waiting_requests is not None or admission_max_kv_usage is not None:
+        if (
+            max_waiting_requests is not None
+            or admission_max_kv_usage is not None
+            or admission_max_prompt_tokens is not None
+        ):
             self.admission_controller = AdmissionController(
                 max_num_seqs=scheduler_config.max_num_seqs,
                 max_waiting_requests=max_waiting_requests,
                 max_kv_usage=admission_max_kv_usage,
+                max_prompt_tokens=admission_max_prompt_tokens,
             )
             if not self.log_stats:
                 self.log_stats = True
@@ -403,6 +435,19 @@ class AsyncLLM(EngineClient):
         """Release a slot reserved by try_reserve_request_slot()."""
         if self.admission_controller is not None:
             self.admission_controller.release()
+
+    def try_admit_prompt(self, num_prompt_tokens: int) -> str | None:
+        """Length-based admission check, run post-tokenization.
+
+        Returns None if the prompt may proceed, or a rejection reason
+        ("long_prompt") when the prompt exceeds --admission-max-prompt-tokens
+        while the engine is busy. Does not reserve or release anything.
+        """
+        if self.admission_controller is None:
+            return None
+        if self.admission_controller.should_reject_long_prompt(num_prompt_tokens):
+            return "long_prompt"
+        return None
 
     def record_request_rejected(self, reason: str) -> None:
         """Record a request rejected before admission (backpressure)."""

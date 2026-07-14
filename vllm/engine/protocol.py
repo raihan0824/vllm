@@ -250,6 +250,17 @@ class EngineClient(ABC):
         """Release a slot previously reserved by :meth:`try_reserve_request_slot`."""
         pass
 
+    def try_admit_prompt(self, num_prompt_tokens: int) -> str | None:
+        """Length-based admission check (admission control), post-tokenization.
+
+        Called by the serving layer once the prompt token count is known,
+        before any prefill work. Returns ``None`` to proceed, or a short
+        rejection reason (e.g. ``long_prompt``) to reject with HTTP 429.
+        Unlike :meth:`try_reserve_request_slot`, this neither reserves nor
+        releases anything. The default implementation always admits.
+        """
+        return None
+
     def record_request_rejected(self, reason: str) -> None:  # noqa: B027
         """Record that an incoming request was rejected before admission.
 

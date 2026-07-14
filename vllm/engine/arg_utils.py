@@ -524,6 +524,7 @@ class EngineArgs:
     max_num_seqs: int | None = None
     max_waiting_requests: int | None = None
     admission_max_kv_usage: float | None = None
+    admission_max_prompt_tokens: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
     use_fp64_gumbel: bool = ModelConfig.use_fp64_gumbel
@@ -1384,6 +1385,10 @@ class EngineArgs:
             "--admission-max-kv-usage", **scheduler_kwargs["admission_max_kv_usage"]
         )
         scheduler_group.add_argument(
+            "--admission-max-prompt-tokens",
+            **scheduler_kwargs["admission_max_prompt_tokens"],
+        )
+        scheduler_group.add_argument(
             "--max-num-partial-prefills", **scheduler_kwargs["max_num_partial_prefills"]
         )
         scheduler_group.add_argument(
@@ -2044,6 +2049,7 @@ class EngineArgs:
             max_num_seqs=self.max_num_seqs,
             max_waiting_requests=self.max_waiting_requests,
             admission_max_kv_usage=self.admission_max_kv_usage,
+            admission_max_prompt_tokens=self.admission_max_prompt_tokens,
             max_model_len=model_config.max_model_len,
             enable_chunked_prefill=self.enable_chunked_prefill,
             disable_chunked_mm_input=self.disable_chunked_mm_input,
