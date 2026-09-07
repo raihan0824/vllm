@@ -9,6 +9,9 @@
 
 from typing import Any
 
+import os
+import sys
+
 import torch
 
 import vllm.envs as envs
@@ -215,6 +218,9 @@ def kernel_unified_attention(
     USE_SOFTCAP: tl.constexpr,  # bool
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
+    USE_CAUSAL: tl.constexpr,  # bool
+    USE_PER_SEQ_CAUSAL: tl.constexpr,  # bool
+    per_seq_causal_ptr,  # [num_seqs] bool, or None
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,
@@ -389,6 +395,8 @@ def kernel_unified_attention(
         SLIDING_WINDOW,
         USE_MM_PREFIX,
         IS_3D,
+        USE_CAUSAL,
+        USE_PER_SEQ_CAUSAL,
         CHUNK_LOOKBACK,
         CHUNK_SIZE,
     )
@@ -493,10 +501,14 @@ def kernel_unified_attention(
             query_abs_pos,
             seq_offset,
             seq_idx,
+            seq_len,
             mm_prefix_range_ptr,
             SLIDING_WINDOW,
             USE_MM_PREFIX,
             MAX_MM_RANGES,
+            USE_CAUSAL,
+            USE_PER_SEQ_CAUSAL,
+            per_seq_causal_ptr,
             CHUNK_LOOKBACK,
             CHUNK_SIZE,
         )
@@ -532,11 +544,19 @@ def kernel_unified_attention(
 
         if SLIDING_WINDOW:
             qpos_lo = q_block_local_idx * BLOCK_Q
-            V = tl.where(
-                (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW,
-                V,
-                0.0,
-            )
+            dist = context_len + qpos_lo - seq_offset[:, None]
+            if USE_PER_SEQ_CAUSAL:
+                is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
+                sw_mask_v = tl.where(
+                    is_causal_seq,
+                    dist < SLIDING_WINDOW,
+                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
+                )
+            elif USE_CAUSAL:
+                sw_mask_v = dist < SLIDING_WINDOW
+            else:
+                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
+            V = tl.where(sw_mask_v, V, 0.0)
         if USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: apply v_scale to P instead of V.
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
@@ -732,6 +752,63 @@ def reduce_segments(
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
 
 
+# Maximum query length (tokens per sequence) for which the split-KV (3D)
+# launch is used. 1 = original behaviour (pure decode only). Spec-decode
+# verify passes have q_len = 1 + num_spec_tokens.
+_MAX_SEQLEN_Q_3D = int(os.environ.get("VLLM_TRITON_ATTN_MAX_SEQLEN_Q_3D", "8"))
+# Below this many programs the 2D launch under-fills the GPU (mirrors the
+# backend's MIN_LAUNCH_GRID_SIZE_2D).
+# Measured on H100 (Gemma-4 26B-A4B, fp8 KV, head_dim 512, 2 KV heads, q_len 5):
+# splitting up to ~512 programs is neutral-to-positive, so the window is wide.
+_MIN_LAUNCH_GRID_SIZE_2D = int(os.environ.get("VLLM_TRITON_ATTN_MIN_GRID_2D", "512"))
+
+
+def _hs512_defaults() -> tuple[int, int, int, int]:
+    """(TILE, BLOCK_M, num_warps, num_stages) for head_dim 512.
+
+    Hopper (228 KB smem): a 64-row query block covers a whole 8-token
+    speculative window, so the KV tile is read once per sequence instead of
+    once per 2-token query block; 8 warps hide the fp8 dequant latency.
+    Measured 1.6x (48 seqs) to 3x (10 seqs) vs the generic heuristics.
+    Other archs: 0 = keep the generic heuristics (Ada's 99 KB smem cannot
+    hold the 64-row block).
+    """
+    try:
+        if current_platform.is_cuda() and current_platform.is_device_capability(90):
+            return (32, 64, 8, 2)
+    except Exception:  # pragma: no cover - platform probing at import time
+        pass
+    return (0, 0, 0, 0)
+
+
+_HS512_DEF = _hs512_defaults()
+# head_dim-512 tile tuning knobs (0 = leave the default heuristics alone).
+_HS512_TILE = int(os.environ.get("VLLM_TRITON_ATTN_HS512_TILE", str(_HS512_DEF[0])))
+_HS512_BLOCK_M = int(os.environ.get("VLLM_TRITON_ATTN_HS512_BLOCK_M", str(_HS512_DEF[1])))
+_HS512_WARPS = int(os.environ.get("VLLM_TRITON_ATTN_HS512_WARPS", str(_HS512_DEF[2])))
+_HS512_STAGES = int(os.environ.get("VLLM_TRITON_ATTN_HS512_STAGES", str(_HS512_DEF[3])))
+# Also apply the head_dim-512 tiles to prefill (max_seqlen_q > 8): measured 2.3x on an
+# 8k prompt on H100 (17.8 -> 7.9 ms per layer call). Never applied to q_len 1.
+_HS512_PREFILL = os.environ.get("VLLM_TRITON_ATTN_HS512_PREFILL", "1" if _HS512_DEF[0] else "0") == "1"
+# head_dim-256 prefill tiles (Gemma sliding layers). 0 = generic heuristics.
+# Prefill-only defaults measured on H100 (fp8 KV, 8k prompt, per layer call):
+#   head_dim 512 / 2 KV heads: 18.0 -> 7.0 ms with (TILE 64, BLOCK_M 64, 8 warps, 1 stage)
+#   head_dim 256 / 8 KV heads, window 1024: 2.74 -> 0.97 ms with (64, 64, 8, 2)
+_HOPPER = bool(_HS512_DEF[0])
+_DEBUG_LAUNCH = os.environ.get("VLLM_TRITON_ATTN_DEBUG", "0") == "1"
+_SEEN_LAUNCHES: set = set()
+_HS512P_DEF = (64, 64, 8, 1) if _HOPPER else (0, 0, 0, 0)
+_HS256_DEF = (64, 64, 8, 2) if _HOPPER else (0, 0, 0, 0)
+_HS512P_TILE = int(os.environ.get("VLLM_TRITON_ATTN_HS512P_TILE", str(_HS512P_DEF[0])))
+_HS512P_BLOCK_M = int(os.environ.get("VLLM_TRITON_ATTN_HS512P_BLOCK_M", str(_HS512P_DEF[1])))
+_HS512P_WARPS = int(os.environ.get("VLLM_TRITON_ATTN_HS512P_WARPS", str(_HS512P_DEF[2])))
+_HS512P_STAGES = int(os.environ.get("VLLM_TRITON_ATTN_HS512P_STAGES", str(_HS512P_DEF[3])))
+_HS256_TILE = int(os.environ.get("VLLM_TRITON_ATTN_HS256_TILE", str(_HS256_DEF[0])))
+_HS256_BLOCK_M = int(os.environ.get("VLLM_TRITON_ATTN_HS256_BLOCK_M", str(_HS256_DEF[1])))
+_HS256_WARPS = int(os.environ.get("VLLM_TRITON_ATTN_HS256_WARPS", str(_HS256_DEF[2])))
+_HS256_STAGES = int(os.environ.get("VLLM_TRITON_ATTN_HS256_STAGES", str(_HS256_DEF[3])))
+
+
 def _is_gemma3_attention(head_size: int, sliding_window: int) -> bool:
     """Detect Gemma3 models via unique (head_size, sliding_window) signature.
 
@@ -802,7 +879,11 @@ def unified_attention(
     # disabling this flag costs nothing.
     use_td: bool = False,
 ):
-    assert causal, "Only causal attention is supported"
+    # Resolve causal: bool or per-seq tensor.
+    use_per_seq_causal = isinstance(causal, torch.Tensor)
+    use_causal = bool(causal) if not use_per_seq_causal else True
+    per_seq_causal_ptr = causal if use_per_seq_causal else None
+
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
@@ -841,6 +922,59 @@ def unified_attention(
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
+    # Tuned launch parameters; ``None`` lets Triton pick its defaults.
+    launch_num_warps: int | None = None
+    launch_num_stages: int | None = None
+
+    # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
+    # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
+    # defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it. A wider KV tile +
+    # more query rows per block + 8 warps is ~2x faster on B200.
+    tuned_large_head = (
+        head_size == 256
+        and max_seqlen_q > 1
+        and num_queries_per_kv <= 16
+        and current_platform.is_device_capability_family(100)
+    )
+    if tuned_large_head:
+        BLOCK_M = 32
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        launch_num_warps = 8
+        launch_num_stages = 2
+
+    # Optional tuning for very large heads (Gemma-4 global layers: head_dim
+    # 512, 2 KV heads). Env-driven so it can be swept without a rebuild.
+    # Only for short multi-token queries (speculative verify): q_len-1 draft
+    # passes and prefill keep the generic heuristics (measured: a 64-row block
+    # wastes rows at q_len 1 and hurts prefill occupancy).
+    is_prefill_q = max_seqlen_q > _MAX_SEQLEN_Q_3D
+    hs512_knobs = None
+    if head_size == 512 and 1 < max_seqlen_q <= _MAX_SEQLEN_Q_3D and _HS512_TILE > 0:
+        hs512_knobs = (_HS512_TILE, _HS512_BLOCK_M, _HS512_WARPS, _HS512_STAGES)
+    elif head_size == 512 and is_prefill_q and _HS512_PREFILL and _HS512P_TILE > 0:
+        hs512_knobs = (_HS512P_TILE, _HS512P_BLOCK_M, _HS512P_WARPS, _HS512P_STAGES)
+    tuned_hs512 = hs512_knobs is not None
+    if tuned_hs512:
+        _t, _bm, _w, _st = hs512_knobs
+        if _bm > 0:
+            BLOCK_M = max(_bm, num_queries_per_kv)
+            BLOCK_Q = BLOCK_M // num_queries_per_kv
+        if _w > 0:
+            launch_num_warps = _w
+        if _st > 0:
+            launch_num_stages = _st
+    tuned_hs256 = (
+        head_size == 256 and _HS256_TILE > 0 and max_seqlen_q > _MAX_SEQLEN_Q_3D
+    )
+    if tuned_hs256:
+        if _HS256_BLOCK_M > 0:
+            BLOCK_M = max(_HS256_BLOCK_M, num_queries_per_kv)
+            BLOCK_Q = BLOCK_M // num_queries_per_kv
+        if _HS256_WARPS > 0:
+            launch_num_warps = _HS256_WARPS
+        if _HS256_STAGES > 0:
+            launch_num_stages = _HS256_STAGES
+
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
@@ -868,6 +1002,16 @@ def unified_attention(
     TILE_SIZE_DECODE = _get_tile_size(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
+
+    # Wider KV tile for the tuned large-head path (see above). Only the 2D
+    # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
+    if tuned_large_head:
+        TILE_SIZE_PREFILL = 128
+    if tuned_hs512:
+        TILE_SIZE_PREFILL = hs512_knobs[0]
+        TILE_SIZE_DECODE = hs512_knobs[0]
+    if tuned_hs256:
+        TILE_SIZE_PREFILL = _HS256_TILE
 
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
@@ -920,14 +1064,27 @@ def unified_attention(
     # 2. The batch includes at least one prefill request, or
     # 3. The number of sequences exceeds the configured threshold, or
     # 4. Batch invariance is enabled
+    # Split-KV (3D) is also worth it for short multi-token queries, i.e.
+    # speculative-decoding verify (q_len = 1 + num_spec_tokens) and draft
+    # passes: without it, the 2D grid is (num_q_blocks, num_kv_heads) which
+    # for a small batch leaves most SMs idle while every program walks the
+    # whole context serially. Bounded by the segment buffers' row capacity.
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
+        # Any query length is fine for the 3D path as long as the partial
+        # buffers have a row per query token; short prefill chunks over long
+        # contexts (the tail chunk of a chunked prefill) benefit as much as
+        # decode does. _MAX_SEQLEN_Q_3D now only bounds the tile tuning.
+        or q.shape[0] > softmax_segm_output.shape[0]
+        # Split while the 2D grid would under-fill the GPU. A pure function of
+        # the (padded) token count, sequence count and KV-head count, so a
+        # captured CUDA graph always replays the launch it was captured with.
+        # The buffer-row guard above bounds the 3D path deterministically.
+        or total_num_q_blocks * num_kv_heads >= _MIN_LAUNCH_GRID_SIZE_2D
         or is_batch_invariant
     )
 
@@ -964,6 +1121,20 @@ def unified_attention(
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
 
+    launch_kwargs: dict[str, int] = {}
+    if launch_num_warps is not None:
+        launch_kwargs["num_warps"] = launch_num_warps
+    if launch_num_stages is not None:
+        launch_kwargs["num_stages"] = launch_num_stages
+
+    if _DEBUG_LAUNCH:
+        _key = (head_size, num_kv_heads, max_seqlen_q > _MAX_SEQLEN_Q_3D, use_3d, BLOCK_M, BLOCK_Q, tile_size,
+                launch_num_warps, launch_num_stages, str(kv_quant_mode), use_td, use_td_qo, use_causal,
+                use_per_seq_causal, use_mm_prefix, q.dtype == current_platform.fp8_dtype(), output_scale is not None,
+                sinks is not None, softcap > 0, window_size[0], block_size, q.shape[0], num_seqs, tuple(grid))
+        if _key not in _SEEN_LAUNCHES:
+            _SEEN_LAUNCHES.add(_key)
+            print("[triton-attn launch]", _key, file=sys.stderr, flush=True)
     kernel_unified_attention[grid](
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
@@ -1002,10 +1173,13 @@ def unified_attention(
         USE_QQ_BIAS=use_qq_bias,
         USE_SOFTCAP=(softcap > 0),
         USE_SINKS=(sinks is not None),
+        SLIDING_WINDOW=(1 + window_size[0]),
+        USE_CAUSAL=use_causal,
+        USE_PER_SEQ_CAUSAL=use_per_seq_causal,
+        per_seq_causal_ptr=per_seq_causal_ptr,
         USE_MM_PREFIX=use_mm_prefix,
         MAX_MM_RANGES=max_mm_ranges,
         mm_prefix_range_ptr=mm_prefix_range,
-        SLIDING_WINDOW=(1 + window_size[0]),
         stride_k_cache_0=k.stride(0),
         stride_k_cache_1=k.stride(1),
         stride_k_cache_2=k.stride(2),
@@ -1033,6 +1207,7 @@ def unified_attention(
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
+        **launch_kwargs,
     )
 
     if use_3d:
