@@ -73,6 +73,9 @@ class StatLoggerBase(ABC):
     def record_request_rejected(self, reason: str):  # noqa
         pass
 
+    def record_admission_slots(self, num_reserved: int):  # noqa
+        pass
+
 
 def load_stat_logger_plugin_factories() -> list[StatLoggerFactory]:
     factories: list[StatLoggerFactory] = []
@@ -551,6 +554,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # --admission-max-kv-usage), so there is no behavior change (no new
         # metric series) when the feature is unused.
         self.counter_num_requests_rejected: Counter | None = None
+        self.gauge_admission_slots_reserved: Gauge | None = None
         if (
             vllm_config.scheduler_config.max_waiting_requests is not None
             or vllm_config.scheduler_config.admission_max_kv_usage is not None
@@ -564,6 +568,21 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 ),
                 labelnames=["model_name", "reason"],
             )
+            # In-flight requests currently holding an admission slot. This is
+            # the quantity the queue gate compares against its bound, and it
+            # is not derivable from the scheduler gauges: it counts requests
+            # for their whole HTTP lifetime, including ones still streaming
+            # out after the engine finished them. Without it, a frontend
+            # rejecting everything looks identical to an idle server.
+            self.gauge_admission_slots_reserved = self._gauge_cls(
+                name="vllm:admission_slots_reserved",
+                documentation=(
+                    "Number of in-flight requests holding an admission slot "
+                    "(frontend backpressure)."
+                ),
+                labelnames=["model_name"],
+                multiprocess_mode="mostrecent",
+            ).labels(model_name)
 
         counter_prefix_cache_queries = self._counter_cls(
             name="vllm:prefix_cache_queries",
@@ -1265,6 +1284,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         if self.counter_num_requests_rejected is not None:
             self.counter_num_requests_rejected.labels(self.model_name, reason).inc()
 
+    def record_admission_slots(self, num_reserved: int):
+        if self.gauge_admission_slots_reserved is not None:
+            self.gauge_admission_slots_reserved.set(num_reserved)
+
     def log_engine_initialized(self):
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
 
@@ -1384,6 +1407,10 @@ class StatLoggerManager:
     def record_request_rejected(self, reason: str):
         for logger in self.stat_loggers:
             logger.record_request_rejected(reason)
+
+    def record_admission_slots(self, num_reserved: int):
+        for logger in self.stat_loggers:
+            logger.record_admission_slots(num_reserved)
 
     def log(self):
         for logger in self.stat_loggers:

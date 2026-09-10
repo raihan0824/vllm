@@ -36,6 +36,7 @@ from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.sagemaker.api_router import sagemaker_standards_bootstrap
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
 from vllm.entrypoints.serve.utils.api_utils import (
+    AdmissionSlotMiddleware,
     cli_env_setup,
     log_non_default_args,
     log_version_and_model,
@@ -267,6 +268,10 @@ def build_app(
 
     # Add scaling middleware to check for scaling state
     app.add_middleware(ScalingMiddleware)
+
+    # Give admission-control slots (--max-waiting-requests) back once the
+    # response has ended, even if the client aborted it mid-stream.
+    app.add_middleware(AdmissionSlotMiddleware)
 
     if "realtime" in supported_tasks:
         # Add WebSocket metrics middleware

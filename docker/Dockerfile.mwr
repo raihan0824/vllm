@@ -19,8 +19,12 @@ from vllm.engine.arg_utils import EngineArgs; \
 from vllm.engine.protocol import EngineClient; \
 assert EngineArgs().max_waiting_requests is None; \
 assert hasattr(EngineClient, 'try_reserve_request_slot'); \
-import vllm.v1.engine.async_llm, vllm.v1.metrics.loggers, \
-       vllm.entrypoints.serve.utils.api_utils; \
+import vllm.v1.engine.async_llm, vllm.v1.metrics.loggers; \
+from vllm.entrypoints.serve.utils.api_utils import AdmissionSlotMiddleware; \
+import vllm.entrypoints.openai.api_server as s; \
+import inspect; \
+assert 'AdmissionSlotMiddleware' in inspect.getsource(s.build_app), \
+       'admission slots would leak: middleware not installed'; \
 print('mwr patch verified')"; \
     rm /tmp/max-waiting-requests.patch
 

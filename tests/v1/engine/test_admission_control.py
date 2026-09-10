@@ -7,6 +7,16 @@ Covers both gates: --max-waiting-requests (queue bound) and
 admitted, or a rejection reason string ("queue_full" / "kv_pressure").
 """
 
+import asyncio
+import contextlib
+
+import pytest
+
+from vllm.entrypoints.serve.utils.api_utils import (
+    ADMISSION_SLOT_SCOPE_KEY,
+    AdmissionSlot,
+    AdmissionSlotMiddleware,
+)
 from vllm.v1.engine.async_llm import AdmissionController
 from vllm.v1.metrics.stats import SchedulerStats
 
@@ -255,3 +265,207 @@ def test_long_prompt_gate_alone_enables_controller_reserve_flow():
     assert results.count(None) == 10  # no queue gate -> all admitted
     assert c.is_busy()
     assert c.should_reject_long_prompt(25001)
+
+
+# ---------------------------------------------------------------------------
+# Slot lifetime (AdmissionSlot / AdmissionSlotMiddleware)
+#
+# A slot outlives its route handler, so it cannot be released by the handler.
+# Releasing it from the response's background task is not enough either:
+# Starlette skips background tasks when a send() fails, so a client aborting
+# mid-stream would leak the slot. Leaks are unrecoverable -- `reserved` only
+# ratchets up until every request is rejected while the engine sits idle.
+# ---------------------------------------------------------------------------
+
+
+async def _noop_receive() -> dict:
+    return {"type": "http.request"}
+
+
+async def _noop_send(message) -> None:
+    pass
+
+
+def _reserving_app(controller: AdmissionController, body):
+    """Downstream ASGI app that reserves a slot, then runs `body`."""
+
+    async def app(scope, receive, send) -> None:
+        assert controller.try_reserve() is None
+        scope[ADMISSION_SLOT_SCOPE_KEY] = AdmissionSlot(controller.release)
+        await body(scope, receive, send)
+
+    return app
+
+
+def _call(app) -> None:
+    asyncio.run(app({"type": "http"}, _noop_receive, _noop_send))
+
+
+def test_slot_releases_exactly_once():
+    c = make_controller(max_num_seqs=8, max_waiting_requests=2)
+    assert c.try_reserve() is None
+    slot = AdmissionSlot(c.release)
+
+    slot.release()
+    slot.release()
+
+    assert c.reserved == 0
+
+
+def test_middleware_releases_slot_after_response():
+    c = make_controller(max_num_seqs=8, max_waiting_requests=2)
+
+    async def respond(scope, receive, send) -> None:
+        assert c.reserved == 1
+
+    _call(AdmissionSlotMiddleware(_reserving_app(c, respond)))
+    assert c.reserved == 0
+
+
+def test_middleware_releases_slot_when_client_aborts_stream():
+    """The leak that bricked a production replica: uvicorn raises when writing
+    to a socket the client already closed, so the response's background task
+    never runs."""
+    c = make_controller(max_num_seqs=8, max_waiting_requests=2)
+
+    async def abort(scope, receive, send) -> None:
+        raise OSError("client disconnected")
+
+    with pytest.raises(OSError):
+        _call(AdmissionSlotMiddleware(_reserving_app(c, abort)))
+
+    assert c.reserved == 0
+
+
+def test_middleware_releases_slot_on_cancellation():
+    c = make_controller(max_num_seqs=8, max_waiting_requests=2)
+
+    async def cancel(scope, receive, send) -> None:
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        _call(AdmissionSlotMiddleware(_reserving_app(c, cancel)))
+
+    assert c.reserved == 0
+
+
+def test_aborted_streams_do_not_ratchet_capacity():
+    """Many aborted streams in a row must not exhaust admission capacity."""
+    c = make_controller(max_num_seqs=4, max_waiting_requests=2)
+
+    async def abort(scope, receive, send) -> None:
+        raise OSError("client disconnected")
+
+    app = AdmissionSlotMiddleware(_reserving_app(c, abort))
+    for _ in range(100):
+        with pytest.raises(OSError):
+            _call(app)
+
+    assert c.reserved == 0
+    assert c.try_reserve() is None
+
+
+def test_middleware_ignores_requests_without_a_slot():
+    c = make_controller(max_num_seqs=8, max_waiting_requests=2)
+    seen = []
+
+    async def app(scope, receive, send) -> None:
+        seen.append(scope["type"])
+
+    _call(AdmissionSlotMiddleware(app))
+    asyncio.run(
+        AdmissionSlotMiddleware(app)({"type": "lifespan"}, _noop_receive, _noop_send)
+    )
+
+    assert seen == ["http", "lifespan"]
+    assert c.reserved == 0
+
+
+@pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
+def test_slot_released_when_client_aborts_a_real_streaming_response(spec_version):
+    """End-to-end through FastAPI/Starlette, the shape that bricked a replica.
+
+    Starlette picks a different StreamingResponse code path per ASGI spec
+    version, and neither reaches the response's background tasks once send()
+    fails, so both are exercised here.
+    """
+    from fastapi import FastAPI, Request
+    from fastapi.responses import StreamingResponse
+
+    from vllm.entrypoints.serve.utils.api_utils import load_aware_call
+
+    controller = make_controller(max_num_seqs=1000, max_waiting_requests=1000)
+
+    class FakeEngineClient:
+        def admission_control_enabled(self) -> bool:
+            return True
+
+        def try_reserve_request_slot(self) -> str | None:
+            return controller.try_reserve()
+
+        def release_request_slot(self) -> None:
+            controller.release()
+
+        def record_request_rejected(self, reason: str) -> None:
+            pass
+
+    app = FastAPI()
+    app.state.engine_client = FakeEngineClient()
+    app.state.enable_server_load_tracking = False
+
+    @app.post("/v1/chat/completions")
+    @load_aware_call
+    async def handler(raw_request: Request):
+        async def stream():
+            for i in range(10):
+                yield f"data: {i}\n\n".encode()
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    async def send_until_socket_dies(message) -> None:
+        # uvicorn raises when writing to a socket the peer already closed.
+        if message["type"] == "http.response.body":
+            raise OSError(104, "Connection reset by peer")
+
+    def receive_body_then_hang():
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": b"{}", "more_body": False}
+            # The client never sends http.disconnect; its socket just dies.
+            await asyncio.Event().wait()
+
+        return receive
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": spec_version},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"test"), (b"content-type", b"application/json")],
+        "client": ("10.0.0.1", 1234),
+        "server": ("test", 80),
+        "extensions": {},
+    }
+
+    async def abort_one() -> None:
+        with contextlib.suppress(BaseException):
+            await AdmissionSlotMiddleware(app)(
+                dict(scope), receive_body_then_hang(), send_until_socket_dies
+            )
+
+    async def abort_many() -> None:
+        for _ in range(20):
+            await abort_one()
+
+    asyncio.run(abort_many())
+
+    assert controller.reserved == 0

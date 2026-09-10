@@ -429,12 +429,22 @@ class AsyncLLM(EngineClient):
         """
         if self.admission_controller is None:
             return None
-        return self.admission_controller.try_reserve()
+        reason = self.admission_controller.try_reserve()
+        if reason is None:
+            self._record_admission_slots()
+        return reason
 
     def release_request_slot(self) -> None:
         """Release a slot reserved by try_reserve_request_slot()."""
         if self.admission_controller is not None:
             self.admission_controller.release()
+            self._record_admission_slots()
+
+    def _record_admission_slots(self) -> None:
+        if self.logger_manager is not None and self.admission_controller is not None:
+            self.logger_manager.record_admission_slots(
+                self.admission_controller.reserved
+            )
 
     def try_admit_prompt(self, num_prompt_tokens: int) -> str | None:
         """Length-based admission check, run post-tokenization.

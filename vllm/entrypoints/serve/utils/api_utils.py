@@ -6,6 +6,7 @@ import dataclasses
 import functools
 import os
 from argparse import Namespace
+from collections.abc import Callable
 from logging import Logger
 from string import Template
 from typing import Any
@@ -15,6 +16,7 @@ from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask, BackgroundTasks
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from vllm import envs
 from vllm.engine.arg_utils import EngineArgs
@@ -128,6 +130,58 @@ def engine_overloaded_response(reason: str) -> JSONResponse:
     )
 
 
+# Scope key holding the AdmissionSlot reserved for the request in flight.
+ADMISSION_SLOT_SCOPE_KEY = "vllm.admission_slot"
+
+
+class AdmissionSlot:
+    """An admission-control reservation, released exactly once.
+
+    Release is idempotent because several paths race to perform it (handler
+    cancellation, the response's background task, the ASGI teardown below);
+    the reservation must be given back on the first of them and never twice.
+    """
+
+    __slots__ = ("_release", "_released")
+
+    def __init__(self, release: Callable[[], None]) -> None:
+        self._release = release
+        self._released = False
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._release()
+
+
+class AdmissionSlotMiddleware:
+    """Releases the request's admission slot once its response has ended.
+
+    A slot must outlive its route handler, since a streaming response is still
+    being sent long after the handler returns. It cannot, however, ride on the
+    response's background task: Starlette skips background tasks when a send()
+    fails, so a client that aborts mid-SSE would leak its slot permanently. The
+    frontend's in-flight count would then only ever ratchet up, until it
+    exceeds the bound and *every* request is rejected with 429 while the engine
+    sits idle -- an unrecoverable state, since no admitted request remains to
+    release anything. An ASGI try/finally is the one teardown the server
+    guarantees to run, whether the response completed, raised, or was aborted.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if (slot := scope.pop(ADMISSION_SLOT_SCOPE_KEY, None)) is not None:
+                slot.release()
+
+
 def check_prompt_admission(engine_client, num_prompt_tokens: int):
     """Length-based admission control (--admission-max-prompt-tokens).
 
@@ -194,9 +248,16 @@ def load_aware_call(func):
         admission = (
             engine_client is not None and engine_client.admission_control_enabled()
         )
-        if admission and (reason := engine_client.try_reserve_request_slot()):
-            engine_client.record_request_rejected(reason)
-            return engine_overloaded_response(reason)
+        slot: AdmissionSlot | None = None
+        if admission:
+            if reason := engine_client.try_reserve_request_slot():
+                engine_client.record_request_rejected(reason)
+                return engine_overloaded_response(reason)
+            # Hand the reservation to AdmissionSlotMiddleware, which releases
+            # it when the response ends -- including a stream the client
+            # aborts, which never runs the background task below.
+            slot = AdmissionSlot(engine_client.release_request_slot)
+            raw_request.scope[ADMISSION_SLOT_SCOPE_KEY] = slot
 
         load_tracking = getattr(app_state, "enable_server_load_tracking", False)
         if load_tracking:
@@ -209,8 +270,8 @@ def load_aware_call(func):
             return await func(*args, **kwargs)
 
         def cleanup() -> None:
-            if admission:
-                engine_client.release_request_slot()
+            if slot is not None:
+                slot.release()
             if load_tracking:
                 app_state.server_load_metrics -= 1
 
@@ -220,8 +281,8 @@ def load_aware_call(func):
             # Client disconnect / cancellation. Release the admission slot;
             # server_load is decremented by listen_for_disconnect (preserving
             # the pre-existing behavior), so don't touch it here.
-            if admission:
-                engine_client.release_request_slot()
+            if slot is not None:
+                slot.release()
             raise
         except Exception:
             cleanup()
