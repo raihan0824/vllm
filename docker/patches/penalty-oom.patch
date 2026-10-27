@@ -1,0 +1,263 @@
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index 6ca42c0e7f..8973f00742 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -48,6 +48,76 @@ def get_token_bin_counts_and_mask(
+     return bin_counts, mask
+ 
+ 
++# Upper bound on the transient memory that apply_penalties allocates on top of
++# the logits. Rows are processed in chunks so that a large batch (with spec
++# decode every request contributes one row per draft token) cannot allocate
++# several GiB of (num_seqs, vocab_size) tables in a single step: these tables
++# are not part of the memory profiling run, so the KV cache leaves no room
++# for them.
++PENALTIES_CHUNK_BYTES = 128 * 1024 * 1024
++
++
++def get_penalties_rows_per_chunk(vocab_size: int, extra_bytes_per_row: int = 0) -> int:
++    """Number of logits rows apply_penalties processes at once.
++
++    Args:
++        vocab_size: The vocabulary size (logits width).
++        extra_bytes_per_row: Per-row memory the caller allocates for the chunk
++            on top of apply_penalties' own tables (e.g. token id tensors).
++
++    Returns:
++        The number of rows per chunk, at least 1.
++    """
++    # Per vocab entry: the prompt mask (bool), int32 output counts, the output
++    # mask (bool) and one float32 temporary for the frequency/presence terms,
++    # plus one byte for the padded prompt mask while it is being built.
++    bytes_per_row = (vocab_size + 1) * (1 + 4 + 1 + 4 + 1) + extra_bytes_per_row
++    return max(1, PENALTIES_CHUNK_BYTES // bytes_per_row)
++
++
++def _apply_penalties_to_rows(
++    logits: torch.Tensor,
++    prompt_tokens_tensor: torch.Tensor,
++    output_tokens_tensor: torch.Tensor,
++    presence_penalties: torch.Tensor,
++    frequency_penalties: torch.Tensor,
++    repetition_penalties: torch.Tensor,
++    apply_repetition_penalties: Callable[
++        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None
++    ],
++) -> None:
++    num_seqs, vocab_size = logits.shape
++    device = prompt_tokens_tensor.device
++
++    # Only presence matters for the prompt: scatter a bool mask directly.
++    # vocab_size + 1 for padding.
++    prompt_mask = torch.zeros(
++        (num_seqs, vocab_size + 1), dtype=torch.bool, device=device
++    )
++    prompt_mask.scatter_(1, prompt_tokens_tensor, True)
++    prompt_mask = prompt_mask[:, :vocab_size].contiguous()
++
++    # int32 counts give the same float32 products below as int64 counts
++    # (counts are far below 2**24), at half the memory.
++    output_bin_counts = torch.zeros(
++        (num_seqs, vocab_size + 1), dtype=torch.int32, device=device
++    )
++    output_bin_counts.scatter_add_(
++        1,
++        output_tokens_tensor,
++        torch.ones_like(output_tokens_tensor, dtype=torch.int32),
++    )
++    output_bin_counts = output_bin_counts[:, :vocab_size]
++    output_mask = output_bin_counts > 0
++
++    apply_repetition_penalties(logits, prompt_mask, output_mask, repetition_penalties)
++
++    # We follow the definition in OpenAI API.
++    # Refer to https://platform.openai.com/docs/api-reference/parameter-details
++    logits -= frequency_penalties.unsqueeze(dim=1) * output_bin_counts
++    logits -= presence_penalties.unsqueeze(dim=1) * output_mask
++
++
+ def apply_penalties(
+     logits: torch.Tensor,
+     prompt_tokens_tensor: torch.Tensor,
+@@ -55,6 +125,8 @@ def apply_penalties(
+     presence_penalties: torch.Tensor,
+     frequency_penalties: torch.Tensor,
+     repetition_penalties: torch.Tensor,
++    *,
++    use_repetition_penalties_kernel: bool | None = None,
+ ) -> torch.Tensor:
+     """
+     Applies penalties in place to the logits tensor
+@@ -68,24 +140,43 @@ def apply_penalties(
+     presence_penalties: The presence penalties of shape (num_seqs, )
+     frequency_penalties: The frequency penalties of shape (num_seqs, )
+     repetition_penalties: The repetition penalties of shape (num_seqs, )
++    use_repetition_penalties_kernel: Whether to use the CUDA repetition
++        penalties kernel rather than the torch implementation. Defaults to
++        whether logits is a contiguous CUDA tensor; callers that pass a slice
++        of a larger tensor should decide it for the larger tensor.
++
++    Rows are processed in chunks (see get_penalties_rows_per_chunk), so the
++    memory used on top of the inputs is bounded regardless of num_seqs.
+     """
+     num_seqs, vocab_size = logits.shape
+-    _, prompt_mask = get_token_bin_counts_and_mask(
+-        prompt_tokens_tensor, vocab_size, num_seqs
+-    )
+-    output_bin_counts, output_mask = get_token_bin_counts_and_mask(
+-        output_tokens_tensor, vocab_size, num_seqs
+-    )
+-
+-    # Apply repetition penalties as a custom op
+-    from vllm._custom_ops import apply_repetition_penalties
+ 
+-    apply_repetition_penalties(logits, prompt_mask, output_mask, repetition_penalties)
++    # Apply repetition penalties as a custom op. Pick the implementation once
++    # for the whole tensor: a row slice of a non-contiguous tensor can be
++    # contiguous, which would otherwise switch implementations between chunks.
++    from vllm._custom_ops import (
++        apply_repetition_penalties_cuda,
++        apply_repetition_penalties_torch,
++    )
+ 
+-    # We follow the definition in OpenAI API.
+-    # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+-    logits -= frequency_penalties.unsqueeze(dim=1) * output_bin_counts
+-    logits -= presence_penalties.unsqueeze(dim=1) * output_mask
++    if use_repetition_penalties_kernel is None:
++        use_repetition_penalties_kernel = logits.is_cuda and logits.is_contiguous()
++    if use_repetition_penalties_kernel:
++        apply_repetition_penalties = apply_repetition_penalties_cuda
++    else:
++        apply_repetition_penalties = apply_repetition_penalties_torch
++
++    chunk_size = get_penalties_rows_per_chunk(vocab_size)
++    for start in range(0, num_seqs, chunk_size):
++        end = min(start + chunk_size, num_seqs)
++        _apply_penalties_to_rows(
++            logits[start:end],
++            prompt_tokens_tensor[start:end],
++            output_tokens_tensor[start:end],
++            presence_penalties[start:end],
++            frequency_penalties[start:end],
++            repetition_penalties[start:end],
++            apply_repetition_penalties,
++        )
+     return logits
+ 
+ 
+diff --git a/vllm/v1/sample/ops/penalties.py b/vllm/v1/sample/ops/penalties.py
+index 7bc6ec7ab8..3a6d1a032a 100644
+--- a/vllm/v1/sample/ops/penalties.py
++++ b/vllm/v1/sample/ops/penalties.py
+@@ -3,7 +3,10 @@
+ 
+ import torch
+ 
+-from vllm.model_executor.layers.utils import apply_penalties
++from vllm.model_executor.layers.utils import (
++    apply_penalties,
++    get_penalties_rows_per_chunk,
++)
+ from vllm.utils.torch_utils import PIN_MEMORY, make_tensor_with_pad
+ 
+ 
+@@ -14,28 +17,53 @@ def apply_all_penalties(
+     frequency_penalties: torch.Tensor,
+     repetition_penalties: torch.Tensor,
+     output_token_ids: list[list[int]],
++    prompt_row_indices: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """
+     Applies presence, frequency and repetition penalties to the logits.
++
++    If prompt_row_indices is given, logits row i uses the prompt in row
++    prompt_row_indices[i] of prompt_token_ids (e.g. one row per draft token
++    with spec decode); otherwise row i uses row i.
++
++    The prompt and output token tensors are built per chunk of rows, so the
++    memory used on top of the logits is bounded regardless of the batch size.
+     """
+-    _, vocab_size = logits.shape
+-    output_tokens_t = _convert_to_tensors(output_token_ids, vocab_size, logits.device)
+-
+-    # In the async scheduling case, rows that won't have penalties applied may contain
+-    # -1 placeholder token ids. We must replace these with valid token ids so that the
+-    # scatter done in apply_penalties is valid.
+-    # NOTE(nick): The penalties implementation is currently quite inefficient and
+-    # will be reworked anyhow.
+-    output_tokens_t.masked_fill_(output_tokens_t == -1, vocab_size)
+-
+-    return apply_penalties(
+-        logits,
+-        prompt_token_ids,
+-        output_tokens_t,
+-        presence_penalties,
+-        frequency_penalties,
+-        repetition_penalties,
+-    )
++    num_rows, vocab_size = logits.shape
++    max_output_len = max((len(ids) for ids in output_token_ids), default=0)
++    # int64 prompt and output token ids are allocated per row of a chunk.
++    token_bytes_per_row = (prompt_token_ids.shape[1] + max_output_len) * 8
++    chunk_size = get_penalties_rows_per_chunk(vocab_size, token_bytes_per_row)
++    # Decided for the whole tensor, not per chunk (see apply_penalties).
++    use_repetition_penalties_kernel = logits.is_cuda and logits.is_contiguous()
++
++    for start in range(0, num_rows, chunk_size):
++        end = min(start + chunk_size, num_rows)
++        if prompt_row_indices is None:
++            prompt_tokens_t = prompt_token_ids[start:end]
++        else:
++            prompt_tokens_t = prompt_token_ids[prompt_row_indices[start:end]]
++        output_tokens_t = _convert_to_tensors(
++            output_token_ids[start:end], vocab_size, logits.device
++        )
++
++        # In the async scheduling case, rows that won't have penalties applied
++        # may contain -1 placeholder token ids. We must replace these with
++        # valid token ids so that the scatter done in apply_penalties is valid.
++        # NOTE(nick): The penalties implementation is currently quite
++        # inefficient and will be reworked anyhow.
++        output_tokens_t.masked_fill_(output_tokens_t == -1, vocab_size)
++
++        apply_penalties(
++            logits[start:end],
++            prompt_tokens_t,
++            output_tokens_t,
++            presence_penalties[start:end],
++            frequency_penalties[start:end],
++            repetition_penalties[start:end],
++            use_repetition_penalties_kernel=use_repetition_penalties_kernel,
++        )
++    return logits
+ 
+ 
+ def _convert_to_tensors(
+diff --git a/vllm/v1/sample/rejection_sampler.py b/vllm/v1/sample/rejection_sampler.py
+index 8b4d8c9dce..d516670220 100644
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -358,18 +358,20 @@ class RejectionSampler(nn.Module):
+ 
+         assert sampling_metadata.prompt_token_ids is not None
+ 
+-        prompt_token_ids = sampling_metadata.prompt_token_ids[repeat_indices]
+         presence_penalties = sampling_metadata.presence_penalties[repeat_indices]
+         frequency_penalties = sampling_metadata.frequency_penalties[repeat_indices]
+         repetition_penalties = sampling_metadata.repetition_penalties[repeat_indices]
+ 
++        # The prompts are gathered per chunk of rows inside apply_all_penalties
++        # rather than repeated here for every draft token up front.
+         logits = apply_all_penalties(
+             logits,
+-            prompt_token_ids,
++            sampling_metadata.prompt_token_ids,
+             presence_penalties,
+             frequency_penalties,
+             repetition_penalties,
+             output_token_ids,
++            prompt_row_indices=repeat_indices,
+         )
+         return logits
+ 

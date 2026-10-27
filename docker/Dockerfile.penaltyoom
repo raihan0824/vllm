@@ -1,0 +1,37 @@
+# Bounded-memory penalties overlay on the v0.24.0-mwr4 image.
+# Penalties used to build dense (rows x vocab) int64 tables in one go; with
+# spec decode (one row per draft token) and a 262k vocab that is GiBs outside
+# the memory profile, which OOMed Gemma-4-26B on 2026-10-27. The patch
+# processes rows in fixed-size chunks with bit-identical results.
+# Patch verified to apply with --fuzz=0 against the image's installed tree
+# (identical to upstream v0.24.0 for the patched files).
+FROM dekaregistry.cloudeka.id/cloudeka-system/vllm-openai:v0.24.0-mwr4@sha256:bb9b84729709bddf991d9e4c501afddc3cd26cfe362c113125ae3c3a99138084
+
+# The image runs as UID 1000; site-packages needs root to patch.
+USER root
+
+COPY patches/penalty-oom.patch /tmp/penalty-oom.patch
+
+# Fail the build unless the patch applies exactly and the chunked path
+# matches the dense one on CPU (no GPU at build time, so no pinning).
+RUN set -e; \
+    VLLM_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))"); \
+    cd "$(dirname "$VLLM_DIR")"; \
+    patch -p1 --fuzz=0 --no-backup-if-mismatch < /tmp/penalty-oom.patch; \
+    python3 -c "\
+import torch; \
+import vllm.model_executor.layers.utils as u; \
+import vllm.v1.sample.ops.penalties as pm; \
+pm.PIN_MEMORY = False; apply_all_penalties = pm.apply_all_penalties; \
+import vllm.v1.sample.rejection_sampler, vllm.v1.sample.sampler; \
+assert u.get_penalties_rows_per_chunk(262144) == 46, u.get_penalties_rows_per_chunk(262144); \
+torch.manual_seed(0); V = 5000; \
+p = torch.randint(0, V, (7, 30)); o = [list(range(i * 3)) + [1, 1] for i in range(7)]; \
+pen = lambda v: torch.full((7,), v); \
+l = torch.randn(7, V); r = l.clone(); \
+apply_all_penalties(l, p, pen(0.3), pen(0.2), pen(1.2), o); \
+u.PENALTIES_CHUNK_BYTES = 1; apply_all_penalties(r, p, pen(0.3), pen(0.2), pen(1.2), o); \
+assert torch.equal(l, r); print('penalty-oom patch verified')"; \
+    rm /tmp/penalty-oom.patch
+
+USER 1000
