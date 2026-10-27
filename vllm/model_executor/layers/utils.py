@@ -48,6 +48,76 @@ def get_token_bin_counts_and_mask(
     return bin_counts, mask
 
 
+# Upper bound on the transient memory that apply_penalties allocates on top of
+# the logits. Rows are processed in chunks so that a large batch (with spec
+# decode every request contributes one row per draft token) cannot allocate
+# several GiB of (num_seqs, vocab_size) tables in a single step: these tables
+# are not part of the memory profiling run, so the KV cache leaves no room
+# for them.
+PENALTIES_CHUNK_BYTES = 128 * 1024 * 1024
+
+
+def get_penalties_rows_per_chunk(vocab_size: int, extra_bytes_per_row: int = 0) -> int:
+    """Number of logits rows apply_penalties processes at once.
+
+    Args:
+        vocab_size: The vocabulary size (logits width).
+        extra_bytes_per_row: Per-row memory the caller allocates for the chunk
+            on top of apply_penalties' own tables (e.g. token id tensors).
+
+    Returns:
+        The number of rows per chunk, at least 1.
+    """
+    # Per vocab entry: the prompt mask (bool), int32 output counts, the output
+    # mask (bool) and one float32 temporary for the frequency/presence terms,
+    # plus one byte for the padded prompt mask while it is being built.
+    bytes_per_row = (vocab_size + 1) * (1 + 4 + 1 + 4 + 1) + extra_bytes_per_row
+    return max(1, PENALTIES_CHUNK_BYTES // bytes_per_row)
+
+
+def _apply_penalties_to_rows(
+    logits: torch.Tensor,
+    prompt_tokens_tensor: torch.Tensor,
+    output_tokens_tensor: torch.Tensor,
+    presence_penalties: torch.Tensor,
+    frequency_penalties: torch.Tensor,
+    repetition_penalties: torch.Tensor,
+    apply_repetition_penalties: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None
+    ],
+) -> None:
+    num_seqs, vocab_size = logits.shape
+    device = prompt_tokens_tensor.device
+
+    # Only presence matters for the prompt: scatter a bool mask directly.
+    # vocab_size + 1 for padding.
+    prompt_mask = torch.zeros(
+        (num_seqs, vocab_size + 1), dtype=torch.bool, device=device
+    )
+    prompt_mask.scatter_(1, prompt_tokens_tensor, True)
+    prompt_mask = prompt_mask[:, :vocab_size].contiguous()
+
+    # int32 counts give the same float32 products below as int64 counts
+    # (counts are far below 2**24), at half the memory.
+    output_bin_counts = torch.zeros(
+        (num_seqs, vocab_size + 1), dtype=torch.int32, device=device
+    )
+    output_bin_counts.scatter_add_(
+        1,
+        output_tokens_tensor,
+        torch.ones_like(output_tokens_tensor, dtype=torch.int32),
+    )
+    output_bin_counts = output_bin_counts[:, :vocab_size]
+    output_mask = output_bin_counts > 0
+
+    apply_repetition_penalties(logits, prompt_mask, output_mask, repetition_penalties)
+
+    # We follow the definition in OpenAI API.
+    # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+    logits -= frequency_penalties.unsqueeze(dim=1) * output_bin_counts
+    logits -= presence_penalties.unsqueeze(dim=1) * output_mask
+
+
 def apply_penalties(
     logits: torch.Tensor,
     prompt_tokens_tensor: torch.Tensor,
@@ -55,6 +125,8 @@ def apply_penalties(
     presence_penalties: torch.Tensor,
     frequency_penalties: torch.Tensor,
     repetition_penalties: torch.Tensor,
+    *,
+    use_repetition_penalties_kernel: bool | None = None,
 ) -> torch.Tensor:
     """
     Applies penalties in place to the logits tensor
@@ -68,24 +140,43 @@ def apply_penalties(
     presence_penalties: The presence penalties of shape (num_seqs, )
     frequency_penalties: The frequency penalties of shape (num_seqs, )
     repetition_penalties: The repetition penalties of shape (num_seqs, )
+    use_repetition_penalties_kernel: Whether to use the CUDA repetition
+        penalties kernel rather than the torch implementation. Defaults to
+        whether logits is a contiguous CUDA tensor; callers that pass a slice
+        of a larger tensor should decide it for the larger tensor.
+
+    Rows are processed in chunks (see get_penalties_rows_per_chunk), so the
+    memory used on top of the inputs is bounded regardless of num_seqs.
     """
     num_seqs, vocab_size = logits.shape
-    _, prompt_mask = get_token_bin_counts_and_mask(
-        prompt_tokens_tensor, vocab_size, num_seqs
+
+    # Apply repetition penalties as a custom op. Pick the implementation once
+    # for the whole tensor: a row slice of a non-contiguous tensor can be
+    # contiguous, which would otherwise switch implementations between chunks.
+    from vllm._custom_ops import (
+        apply_repetition_penalties_cuda,
+        apply_repetition_penalties_torch,
     )
-    output_bin_counts, output_mask = get_token_bin_counts_and_mask(
-        output_tokens_tensor, vocab_size, num_seqs
-    )
 
-    # Apply repetition penalties as a custom op
-    from vllm._custom_ops import apply_repetition_penalties
+    if use_repetition_penalties_kernel is None:
+        use_repetition_penalties_kernel = logits.is_cuda and logits.is_contiguous()
+    if use_repetition_penalties_kernel:
+        apply_repetition_penalties = apply_repetition_penalties_cuda
+    else:
+        apply_repetition_penalties = apply_repetition_penalties_torch
 
-    apply_repetition_penalties(logits, prompt_mask, output_mask, repetition_penalties)
-
-    # We follow the definition in OpenAI API.
-    # Refer to https://platform.openai.com/docs/api-reference/parameter-details
-    logits -= frequency_penalties.unsqueeze(dim=1) * output_bin_counts
-    logits -= presence_penalties.unsqueeze(dim=1) * output_mask
+    chunk_size = get_penalties_rows_per_chunk(vocab_size)
+    for start in range(0, num_seqs, chunk_size):
+        end = min(start + chunk_size, num_seqs)
+        _apply_penalties_to_rows(
+            logits[start:end],
+            prompt_tokens_tensor[start:end],
+            output_tokens_tensor[start:end],
+            presence_penalties[start:end],
+            frequency_penalties[start:end],
+            repetition_penalties[start:end],
+            apply_repetition_penalties,
+        )
     return logits
 
 

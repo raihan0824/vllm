@@ -358,18 +358,20 @@ class RejectionSampler(nn.Module):
 
         assert sampling_metadata.prompt_token_ids is not None
 
-        prompt_token_ids = sampling_metadata.prompt_token_ids[repeat_indices]
         presence_penalties = sampling_metadata.presence_penalties[repeat_indices]
         frequency_penalties = sampling_metadata.frequency_penalties[repeat_indices]
         repetition_penalties = sampling_metadata.repetition_penalties[repeat_indices]
 
+        # The prompts are gathered per chunk of rows inside apply_all_penalties
+        # rather than repeated here for every draft token up front.
         logits = apply_all_penalties(
             logits,
-            prompt_token_ids,
+            sampling_metadata.prompt_token_ids,
             presence_penalties,
             frequency_penalties,
             repetition_penalties,
             output_token_ids,
+            prompt_row_indices=repeat_indices,
         )
         return logits
 
