@@ -17,6 +17,7 @@ from vllm.v1.structured_output.backend_types import (
     StructuredOutputGrammar,
     StructuredOutputOptions,
 )
+from vllm.v1.structured_output.request import grammar_compile_error_detail
 from vllm.v1.structured_output.utils import (
     choice_as_grammar,
     compile_regex_with_timeout,
@@ -269,6 +270,12 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
     return check_object(schema)
 
 
+class XgrammarJSONSchemaError(ValueError):
+    """xgrammar cannot convert the JSON schema into a grammar (e.g. an empty
+    ``enum``). The engine compiles with a single backend, normally xgrammar,
+    so such a schema must be rejected rather than routed to another backend."""
+
+
 def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
     """Validate that the request is supported by structured output.
 
@@ -319,8 +326,9 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
         try:
             xgr.Grammar.from_json_schema(schema)
         except Exception as err:
-            raise ValueError(
-                f"Failed to transform json schema into a grammar: {err}"
+            raise XgrammarJSONSchemaError(
+                "Invalid JSON schema for structured output: "
+                + grammar_compile_error_detail(err)
             ) from err
         return
 

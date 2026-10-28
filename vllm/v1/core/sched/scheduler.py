@@ -60,6 +60,10 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.structured_output.request import (
+    GRAMMAR_COMPILE_ERROR_PREFIX,
+    grammar_compile_error_message,
+)
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
@@ -196,6 +200,10 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+
+        # Requests whose grammar failed to compile (request id -> message),
+        # finished as per-request errors in update_from_output.
+        self.grammar_compile_error_reqs: dict[str, str] = {}
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -1729,6 +1737,36 @@ class Scheduler(SchedulerInterface):
                     )
                 )
 
+        if self.grammar_compile_error_reqs:
+            grammar_errors = self.grammar_compile_error_reqs
+            self.grammar_compile_error_reqs = {}
+            requests = [
+                self.requests[req_id]
+                for req_id in grammar_errors
+                if req_id in self.requests
+            ]
+            # Skip requests that finished meanwhile (e.g. aborted by the client).
+            finished = {
+                req_id
+                for req_id, _ in self.finish_requests(
+                    [r.request_id for r in requests], RequestStatus.FINISHED_ERROR
+                )
+            }
+            for request in requests:
+                if request.request_id not in finished:
+                    continue
+                outputs[request.client_index].append(
+                    EngineCoreOutput(
+                        request_id=request.request_id,
+                        new_token_ids=[],
+                        finish_reason=request.get_finished_reason(),
+                        stop_reason=GRAMMAR_COMPILE_ERROR_PREFIX
+                        + grammar_errors[request.request_id],
+                        events=request.take_events(),
+                        trace_headers=request.trace_headers,
+                    )
+                )
+
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
@@ -2405,7 +2443,14 @@ class Scheduler(SchedulerInterface):
 
         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
             structured_output_req = request.structured_output_request
-            if not (structured_output_req and structured_output_req.grammar):
+            if not structured_output_req or structured_output_req.grammar is None:
+                return False
+            if isinstance(structured_output_req.grammar, Exception):
+                # Fail only this request (in update_from_output), never the
+                # engine.
+                self.grammar_compile_error_reqs[request.request_id] = (
+                    grammar_compile_error_message(structured_output_req.grammar)
+                )
                 return False
             request.status = RequestStatus.WAITING
             return True

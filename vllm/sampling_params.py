@@ -930,7 +930,10 @@ class SamplingParams(
         from vllm.v1.structured_output.backend_outlines import (
             validate_structured_output_request_outlines,
         )
-        from vllm.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
+        from vllm.v1.structured_output.backend_xgrammar import (
+            XgrammarJSONSchemaError,
+            validate_xgrammar_grammar,
+        )
 
         if backend.startswith("xgrammar"):
             # xgrammar with no fallback
@@ -973,6 +976,12 @@ class SamplingParams(
             try:
                 validate_xgrammar_grammar(self)
                 self.structured_outputs._backend = "xgrammar"
+            except XgrammarJSONSchemaError:
+                # Not a feature xgrammar lacks but a schema it cannot convert
+                # (e.g. an empty enum). The engine compiles every request with
+                # the backend it started with, normally xgrammar, so falling
+                # back to another backend here would fail inside the engine.
+                raise
             except ValueError:
                 # The request either failed validation
                 # or includes some jsonschema feature(s) that

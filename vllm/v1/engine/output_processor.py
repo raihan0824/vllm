@@ -10,6 +10,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+from vllm.exceptions import VLLMValidationError
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -37,6 +38,7 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+from vllm.v1.structured_output.request import GRAMMAR_COMPILE_ERROR_PREFIX
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -647,8 +649,22 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
-            # 4) Create and handle RequestOutput objects.
-            if request_output := req_state.make_request_output(
+            # 4) Create and handle RequestOutput objects. A request whose grammar
+            # failed to compile is a client error: AsyncLLM gets the exception
+            # (HTTP 400) instead of an output.
+            if (
+                finish_reason == FinishReason.ERROR
+                and isinstance(stop_reason, str)
+                and stop_reason.startswith(GRAMMAR_COMPILE_ERROR_PREFIX)
+                and req_state.queue is not None
+            ):
+                req_state.queue.put(
+                    VLLMValidationError(
+                        stop_reason[len(GRAMMAR_COMPILE_ERROR_PREFIX) :],
+                        parameter="structured_outputs",
+                    )
+                )
+            elif request_output := req_state.make_request_output(
                 new_token_ids,
                 pooling_output,
                 finish_reason,

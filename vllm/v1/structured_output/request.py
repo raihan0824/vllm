@@ -3,6 +3,7 @@
 import dataclasses
 import functools
 import json
+import re
 from concurrent.futures import Future
 from concurrent.futures._base import TimeoutError
 from typing import TYPE_CHECKING, Any, cast
@@ -18,10 +19,42 @@ if TYPE_CHECKING:
     from vllm.reasoning import ReasoningParser
 
 
+# stop_reason prefix with which the engine reports a request whose grammar
+# failed to compile; the frontend turns it into a validation error (HTTP 400).
+GRAMMAR_COMPILE_ERROR_PREFIX = "vllm.invalid_structured_output:"
+
+# xgrammar errors start with "[hh:mm:ss] /path/to/file.cc:123: ".
+_NATIVE_ERROR_LOCATION = re.compile(r"^\[[\d:]+\]\s*\S+:\d+:\s*")
+
+
+def grammar_compile_error_detail(exc: Exception) -> str:
+    """The first line of a grammar compilation error, without the native
+    source location.
+
+    Args:
+        exc: The exception raised while compiling the grammar.
+
+    Returns:
+        The cleaned error text, or the exception type name if it is empty.
+    """
+    lines = str(exc).strip().splitlines()
+    detail = _NATIVE_ERROR_LOCATION.sub("", lines[0]) if lines else ""
+    return detail or type(exc).__name__
+
+
+def grammar_compile_error_message(exc: Exception) -> str:
+    """Client-facing message for a grammar that failed to compile."""
+    return f"Invalid structured output: {grammar_compile_error_detail(exc)}"
+
+
 @dataclasses.dataclass
 class StructuredOutputRequest:
     params: StructuredOutputsParams
-    _grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar | None = None
+    # A failed grammar compilation is stored as its exception, so the scheduler
+    # can fail only this request instead of the engine.
+    _grammar: (
+        Future[StructuredOutputGrammar] | StructuredOutputGrammar | Exception | None
+    ) = None
     reasoning_ended: bool | None = None
     reasoning_parser_kwargs: dict[str, Any] | None = None
     # Cached per request; do not share reasoning parsers across requests because
@@ -50,6 +83,8 @@ class StructuredOutputRequest:
                 self.status = RequestStatus.WAITING
             except TimeoutError:
                 return False
+            except Exception as e:
+                self._grammar = e
         return True
 
     @property
@@ -57,11 +92,12 @@ class StructuredOutputRequest:
         return self._check_grammar_completion()
 
     @property
-    def grammar(self) -> StructuredOutputGrammar | None:
-        completed = self._check_grammar_completion()
-        return (
-            cast(StructuredOutputGrammar | None, self._grammar) if completed else None
-        )
+    def grammar(self) -> StructuredOutputGrammar | Exception | None:
+        """The compiled grammar, the exception if compilation failed, or None
+        while compilation is still running."""
+        if not self._check_grammar_completion():
+            return None
+        return cast(StructuredOutputGrammar | Exception | None, self._grammar)
 
     @grammar.setter
     def grammar(
