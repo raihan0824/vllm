@@ -1,0 +1,330 @@
+diff --git a/vllm/sampling_params.py b/vllm/sampling_params.py
+index c8c5c4d80b..be22d123f9 100644
+--- a/vllm/sampling_params.py
++++ b/vllm/sampling_params.py
+@@ -930,7 +930,10 @@ class SamplingParams(
+         from vllm.v1.structured_output.backend_outlines import (
+             validate_structured_output_request_outlines,
+         )
+-        from vllm.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
++        from vllm.v1.structured_output.backend_xgrammar import (
++            XgrammarJSONSchemaError,
++            validate_xgrammar_grammar,
++        )
+ 
+         if backend.startswith("xgrammar"):
+             # xgrammar with no fallback
+@@ -973,6 +976,12 @@ class SamplingParams(
+             try:
+                 validate_xgrammar_grammar(self)
+                 self.structured_outputs._backend = "xgrammar"
++            except XgrammarJSONSchemaError:
++                # Not a feature xgrammar lacks but a schema it cannot convert
++                # (e.g. an empty enum). The engine compiles every request with
++                # the backend it started with, normally xgrammar, so falling
++                # back to another backend here would fail inside the engine.
++                raise
+             except ValueError:
+                 # The request either failed validation
+                 # or includes some jsonschema feature(s) that
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 90d93a110c..4795501f2d 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -60,6 +60,10 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+ from vllm.v1.structured_output import StructuredOutputManager
++from vllm.v1.structured_output.request import (
++    GRAMMAR_COMPILE_ERROR_PREFIX,
++    grammar_compile_error_message,
++)
+ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ logger = init_logger(__name__)
+@@ -197,6 +201,10 @@ class Scheduler(SchedulerInterface):
+         self.finished_recving_kv_req_ids: set[str] = set()
+         self.failed_recving_kv_req_ids: set[str] = set()
+ 
++        # Requests whose grammar failed to compile (request id -> message),
++        # finished as per-request errors in update_from_output.
++        self.grammar_compile_error_reqs: dict[str, str] = {}
++
+         # Encoder-related.
+         # Calculate encoder cache size if applicable
+         supports_mm_inputs = mm_registry.supports_multimodal_inputs(
+@@ -1729,6 +1737,36 @@ class Scheduler(SchedulerInterface):
+                     )
+                 )
+ 
++        if self.grammar_compile_error_reqs:
++            grammar_errors = self.grammar_compile_error_reqs
++            self.grammar_compile_error_reqs = {}
++            requests = [
++                self.requests[req_id]
++                for req_id in grammar_errors
++                if req_id in self.requests
++            ]
++            # Skip requests that finished meanwhile (e.g. aborted by the client).
++            finished = {
++                req_id
++                for req_id, _ in self.finish_requests(
++                    [r.request_id for r in requests], RequestStatus.FINISHED_ERROR
++                )
++            }
++            for request in requests:
++                if request.request_id not in finished:
++                    continue
++                outputs[request.client_index].append(
++                    EngineCoreOutput(
++                        request_id=request.request_id,
++                        new_token_ids=[],
++                        finish_reason=request.get_finished_reason(),
++                        stop_reason=GRAMMAR_COMPILE_ERROR_PREFIX
++                        + grammar_errors[request.request_id],
++                        events=request.take_events(),
++                        trace_headers=request.trace_headers,
++                    )
++                )
++
+         # KV Connector: update state for finished KV Transfers.
+         if kv_connector_output:
+             self._update_from_kv_xfer_finished(kv_connector_output)
+@@ -2405,7 +2443,14 @@ class Scheduler(SchedulerInterface):
+ 
+         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+             structured_output_req = request.structured_output_request
+-            if not (structured_output_req and structured_output_req.grammar):
++            if not structured_output_req or structured_output_req.grammar is None:
++                return False
++            if isinstance(structured_output_req.grammar, Exception):
++                # Fail only this request (in update_from_output), never the
++                # engine.
++                self.grammar_compile_error_reqs[request.request_id] = (
++                    grammar_compile_error_message(structured_output_req.grammar)
++                )
+                 return False
+             request.status = RequestStatus.WAITING
+             return True
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index e1032cfd1f..02481a0f5a 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -10,6 +10,7 @@ from typing import Any, cast
+ import numpy as np
+ import torch
+ 
++from vllm.exceptions import VLLMValidationError
+ from vllm.lora.request import LoRARequest
+ from vllm.outputs import (
+     STREAM_FINISHED,
+@@ -37,6 +38,7 @@ from vllm.v1.metrics.stats import (
+     RequestStateStats,
+     SchedulerStats,
+ )
++from vllm.v1.structured_output.request import GRAMMAR_COMPILE_ERROR_PREFIX
+ 
+ # shared empty CPU tensor used as a placeholder pooling output
+ EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
+@@ -647,8 +649,22 @@ class OutputProcessor:
+                 # if required.
+                 req_state.logprobs_processor.update_from_output(engine_core_output)
+ 
+-            # 4) Create and handle RequestOutput objects.
+-            if request_output := req_state.make_request_output(
++            # 4) Create and handle RequestOutput objects. A request whose grammar
++            # failed to compile is a client error: AsyncLLM gets the exception
++            # (HTTP 400) instead of an output.
++            if (
++                finish_reason == FinishReason.ERROR
++                and isinstance(stop_reason, str)
++                and stop_reason.startswith(GRAMMAR_COMPILE_ERROR_PREFIX)
++                and req_state.queue is not None
++            ):
++                req_state.queue.put(
++                    VLLMValidationError(
++                        stop_reason[len(GRAMMAR_COMPILE_ERROR_PREFIX) :],
++                        parameter="structured_outputs",
++                    )
++                )
++            elif request_output := req_state.make_request_output(
+                 new_token_ids,
+                 pooling_output,
+                 finish_reason,
+diff --git a/vllm/v1/structured_output/__init__.py b/vllm/v1/structured_output/__init__.py
+index 30921f3d74..01c7a7ffdc 100644
+--- a/vllm/v1/structured_output/__init__.py
++++ b/vllm/v1/structured_output/__init__.py
+@@ -18,6 +18,7 @@ from vllm.v1.structured_output.backend_types import (
+     StructuredOutputOptions,
+ )
+ from vllm.v1.structured_output.backend_xgrammar import XgrammarBackend
++from vllm.v1.structured_output.request import grammar_compile_error_message
+ 
+ if TYPE_CHECKING:
+     import numpy as np
+@@ -164,24 +165,36 @@ class StructuredOutputManager:
+             else:
+                 raise ValueError(f"Unsupported structured output backend: {backend}")
+ 
++        grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar
+         if self._use_async_grammar_compilation:
+             grammar = self.executor.submit(self._create_grammar, request)
+         else:
+-            grammar = self._create_grammar(request)  # type: ignore[assignment]
+-        request.structured_output_request.grammar = grammar  # type: ignore[assignment]
++            try:
++                grammar = self._create_grammar(request)
++            except Exception as e:
++                grammar = Future()
++                grammar.set_exception(e)
++        request.structured_output_request.grammar = grammar  # type: ignore[union-attr]
+ 
+     def _create_grammar(self, request: "Request") -> StructuredOutputGrammar:
+         key = request.structured_output_request.structured_output_key  # type: ignore[union-attr]
+ 
+-        # Note that the request was validated in the engine core client,
+-        # so at this point we know it is a supported type of request.
+-        #
+-        # TODO: we still need to handle xgrammar compilation failures,
+-        # though it should be unlikely as we test that up front as well.
++        # The request was validated in the engine core client, but compilation
++        # can still fail, e.g. when the engine's backend differs from the one
++        # the request resolved to. The error reaches the scheduler through the
++        # grammar Future, which fails only this request.
+         request_type, grammar_spec = key
+ 
+         assert self.backend is not None
+-        return self.backend.compile_grammar(request_type, grammar_spec)
++        try:
++            return self.backend.compile_grammar(request_type, grammar_spec)
++        except Exception as e:
++            logger.warning(
++                "Failed to compile grammar for request %s: %s",
++                request.request_id,
++                grammar_compile_error_message(e),
++            )
++            raise
+ 
+     def _fill_bitmasks(
+         self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]
+diff --git a/vllm/v1/structured_output/backend_xgrammar.py b/vllm/v1/structured_output/backend_xgrammar.py
+index 4f199a1a27..7ed0a8df37 100644
+--- a/vllm/v1/structured_output/backend_xgrammar.py
++++ b/vllm/v1/structured_output/backend_xgrammar.py
+@@ -17,6 +17,7 @@ from vllm.v1.structured_output.backend_types import (
+     StructuredOutputGrammar,
+     StructuredOutputOptions,
+ )
++from vllm.v1.structured_output.request import grammar_compile_error_detail
+ from vllm.v1.structured_output.utils import (
+     choice_as_grammar,
+     compile_regex_with_timeout,
+@@ -269,6 +270,12 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
+     return check_object(schema)
+ 
+ 
++class XgrammarJSONSchemaError(ValueError):
++    """xgrammar cannot convert the JSON schema into a grammar (e.g. an empty
++    ``enum``). The engine compiles with a single backend, normally xgrammar,
++    so such a schema must be rejected rather than routed to another backend."""
++
++
+ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
+     """Validate that the request is supported by structured output.
+ 
+@@ -319,8 +326,9 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
+         try:
+             xgr.Grammar.from_json_schema(schema)
+         except Exception as err:
+-            raise ValueError(
+-                f"Failed to transform json schema into a grammar: {err}"
++            raise XgrammarJSONSchemaError(
++                "Invalid JSON schema for structured output: "
++                + grammar_compile_error_detail(err)
+             ) from err
+         return
+ 
+diff --git a/vllm/v1/structured_output/request.py b/vllm/v1/structured_output/request.py
+index dfa8c7efca..7652858e94 100644
+--- a/vllm/v1/structured_output/request.py
++++ b/vllm/v1/structured_output/request.py
+@@ -3,6 +3,7 @@
+ import dataclasses
+ import functools
+ import json
++import re
+ from concurrent.futures import Future
+ from concurrent.futures._base import TimeoutError
+ from typing import TYPE_CHECKING, Any, cast
+@@ -18,10 +19,42 @@ if TYPE_CHECKING:
+     from vllm.reasoning import ReasoningParser
+ 
+ 
++# stop_reason prefix with which the engine reports a request whose grammar
++# failed to compile; the frontend turns it into a validation error (HTTP 400).
++GRAMMAR_COMPILE_ERROR_PREFIX = "vllm.invalid_structured_output:"
++
++# xgrammar errors start with "[hh:mm:ss] /path/to/file.cc:123: ".
++_NATIVE_ERROR_LOCATION = re.compile(r"^\[[\d:]+\]\s*\S+:\d+:\s*")
++
++
++def grammar_compile_error_detail(exc: Exception) -> str:
++    """The first line of a grammar compilation error, without the native
++    source location.
++
++    Args:
++        exc: The exception raised while compiling the grammar.
++
++    Returns:
++        The cleaned error text, or the exception type name if it is empty.
++    """
++    lines = str(exc).strip().splitlines()
++    detail = _NATIVE_ERROR_LOCATION.sub("", lines[0]) if lines else ""
++    return detail or type(exc).__name__
++
++
++def grammar_compile_error_message(exc: Exception) -> str:
++    """Client-facing message for a grammar that failed to compile."""
++    return f"Invalid structured output: {grammar_compile_error_detail(exc)}"
++
++
+ @dataclasses.dataclass
+ class StructuredOutputRequest:
+     params: StructuredOutputsParams
+-    _grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar | None = None
++    # A failed grammar compilation is stored as its exception, so the scheduler
++    # can fail only this request instead of the engine.
++    _grammar: (
++        Future[StructuredOutputGrammar] | StructuredOutputGrammar | Exception | None
++    ) = None
+     reasoning_ended: bool | None = None
+     reasoning_parser_kwargs: dict[str, Any] | None = None
+     # Cached per request; do not share reasoning parsers across requests because
+@@ -50,6 +83,8 @@ class StructuredOutputRequest:
+                 self.status = RequestStatus.WAITING
+             except TimeoutError:
+                 return False
++            except Exception as e:
++                self._grammar = e
+         return True
+ 
+     @property
+@@ -57,11 +92,12 @@ class StructuredOutputRequest:
+         return self._check_grammar_completion()
+ 
+     @property
+-    def grammar(self) -> StructuredOutputGrammar | None:
+-        completed = self._check_grammar_completion()
+-        return (
+-            cast(StructuredOutputGrammar | None, self._grammar) if completed else None
+-        )
++    def grammar(self) -> StructuredOutputGrammar | Exception | None:
++        """The compiled grammar, the exception if compilation failed, or None
++        while compilation is still running."""
++        if not self._check_grammar_completion():
++            return None
++        return cast(StructuredOutputGrammar | Exception | None, self._grammar)
+ 
+     @grammar.setter
+     def grammar(

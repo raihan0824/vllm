@@ -1,0 +1,29 @@
+# Grammar compile failures -> per-request HTTP 400, never an engine crash.
+# 2026-10-28 22:00 WIB: one JSON schema with an empty "enum" killed 7 of 8
+# gpt-oss-120b pods. The frontend's auto validation fell back to guidance, but
+# the engine compiled the request with the xgrammar backend it had latched,
+# and the compile error was raised inside scheduler.schedule().
+# Patch generated against upstream v0.24.0, which is byte-identical to the
+# installed tree of both bases for the patched files; applied with --fuzz=0.
+#   gpt-oss-120b: --build-arg BASE=<vllm-openai:v0.24.0-mwr4@sha256:...>
+#   Gemma-4-26B:  --build-arg BASE=<vllm-openai-dev:...-penaltyoom3-media400@...>
+ARG BASE
+FROM ${BASE}
+
+# The images run as UID 1000; site-packages needs root to patch.
+USER root
+
+ARG CHECK=gpt-oss
+COPY patches/grammar-400.patch /tmp/grammar-400.patch
+COPY patches/grammar-400-check.py /tmp/grammar-400-check.py
+
+# Fail the build unless the patch applies exactly, the incident schema is
+# rejected with a clean client error, and the base's own patches survive.
+RUN set -e; \
+    VLLM_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))"); \
+    cd "$(dirname "$VLLM_DIR")"; \
+    patch -p1 --fuzz=0 --no-backup-if-mismatch < /tmp/grammar-400.patch; \
+    cd /tmp && python3 /tmp/grammar-400-check.py ${CHECK}; \
+    rm /tmp/grammar-400.patch /tmp/grammar-400-check.py
+
+USER 1000
