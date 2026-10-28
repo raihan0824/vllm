@@ -16,6 +16,7 @@ import requests
 import torch
 from PIL import Image, ImageChops
 
+from vllm.exceptions import VLLMValidationError
 from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.multimodal.media import MediaConnector
@@ -350,12 +351,15 @@ async def test_ssrf_bypass_backslash_in_url(local_asset_server):
     # server) using the normalised URL.  The normalised path will be
     # /%5C@example.com/<asset> which won't match any file the server
     # knows about, so we expect an HTTP error — but crucially NOT a
-    # successful fetch from example.com.
-    with pytest.raises(requests.exceptions.HTTPError):
+    # successful fetch from example.com. Fetch errors reach the client as a
+    # 400 naming the host; the original HTTP error is kept as the cause.
+    with pytest.raises(VLLMValidationError, match="127.0.0.1: HTTP ") as exc:
         connector.fetch_image(bypass_url)
+    assert isinstance(exc.value.__cause__, requests.exceptions.HTTPError)
 
-    with pytest.raises(aiohttp.ClientResponseError):
+    with pytest.raises(VLLMValidationError, match="127.0.0.1: HTTP ") as exc:
         await connector.fetch_image_async(bypass_url)
+    assert isinstance(exc.value.__cause__, aiohttp.ClientResponseError)
 
 
 @pytest.mark.asyncio

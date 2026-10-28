@@ -1,0 +1,35 @@
+# Media fetch errors -> HTTP 400, on top of the live penalty-OOM image.
+# A media URL that cannot be fetched (HTTP error from the media host, timeout,
+# DNS/connection failure) was an unhandled aiohttp/requests exception -> 500.
+# Patch verified to apply with --fuzz=0 against the image's installed tree
+# (identical to upstream v0.24.0 for this file).
+FROM dekaregistry.cloudeka.id/cloudeka-system/vllm-openai-dev:v0.24.0-mwr4-penaltyoom3@sha256:a0ce8a20fe091482843c9ad33691ebae47af08bacc2e74b770f49670c38e6c7f
+
+# The image runs as UID 1000; site-packages needs root to patch.
+USER root
+
+COPY patches/media-fetch-400.patch /tmp/media-fetch-400.patch
+
+# Fail the build unless the patch applies exactly and a 403 from the media
+# host maps to a 400 that names only the host.
+RUN set -e; \
+    VLLM_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))"); \
+    cd "$(dirname "$VLLM_DIR")"; \
+    patch -p1 --fuzz=0 --no-backup-if-mismatch < /tmp/media-fetch-400.patch; \
+    python3 -c "\
+import aiohttp; \
+from urllib3.util import parse_url; \
+from vllm.multimodal.media.connector import _wrap_media_fetch_error; \
+from vllm.entrypoints.serve.utils.error_response import create_error_response; \
+from vllm.model_executor.layers.utils import get_penalties_rows_per_chunk; \
+u = parse_url('https://x.r2.cloudflarestorage.com/a.jpg?X-Amz-Signature=secret'); \
+e = aiohttp.ClientResponseError(None, (), status=403, message='Forbidden'); \
+w = _wrap_media_fetch_error(u, e); \
+r = create_error_response(w); \
+assert r.error.code == 400, r; \
+assert 'secret' not in r.error.message and 'x.r2.cloudflarestorage.com' in r.error.message, r; \
+assert get_penalties_rows_per_chunk(262144) == 46; \
+print('media-fetch-400 patch verified:', r.error.message)"; \
+    rm /tmp/media-fetch-400.patch
+
+USER 1000

@@ -1,0 +1,136 @@
+diff --git a/vllm/multimodal/media/connector.py b/vllm/multimodal/media/connector.py
+index 312239ad3f..30d791dab0 100644
+--- a/vllm/multimodal/media/connector.py
++++ b/vllm/multimodal/media/connector.py
+@@ -9,18 +9,22 @@ import os
+ import tempfile
+ import time
+ from concurrent.futures import ThreadPoolExecutor
++from http import HTTPStatus
+ from pathlib import Path
+ from typing import Any, TypeVar
+ from urllib.request import url2pathname
+ 
++import aiohttp
+ import numpy as np
+ import numpy.typing as npt
++import requests
+ import torch
+ from PIL import Image, UnidentifiedImageError
+ from urllib3.util import Url, parse_url
+ 
+ import vllm.envs as envs
+ from vllm.connections import HTTPConnection, global_http_connection
++from vllm.exceptions import VLLMValidationError
+ from vllm.logger import init_logger
+ from vllm.multimodal.video import get_video_loader_backend_for_processor
+ from vllm.utils.registry import ExtensionManager
+@@ -41,6 +45,62 @@ atexit.register(global_thread_pool.shutdown)
+ 
+ MEDIA_CONNECTOR_REGISTRY = ExtensionManager()
+ 
++
++def _http_status_reason(status: int) -> str:
++    # The standard phrase, not the media host's own reason text, which a
++    # third-party server controls.
++    try:
++        return f"HTTP {status} {HTTPStatus(status).phrase}"
++    except ValueError:
++        return f"HTTP {status}"
++
++
++def _wrap_media_fetch_error(url_spec: Url, exc: Exception) -> Exception:
++    """Map a failure to download media from a URL to a client error (HTTP 400).
++
++    The URL comes from the request, so a dead or unreachable link (any HTTP
++    error status from the media host, timeouts, DNS or connection failures)
++    is the client's problem, not a server error. Called after the connection's
++    own retries are exhausted. Only the host is named in the message: media
++    URLs are often presigned and carry credentials in the query string.
++
++    Args:
++        url_spec: The parsed media URL.
++        exc: The exception raised while downloading it.
++
++    Returns:
++        A VLLMValidationError for download failures, else exc unchanged.
++    """
++    where = f"Failed to fetch media from {url_spec.host or 'URL'}"
++    if isinstance(exc, aiohttp.ClientResponseError):
++        reason = _http_status_reason(exc.status)
++    elif isinstance(exc, requests.exceptions.HTTPError):
++        response = exc.response
++        if response is None:
++            reason = "HTTP error"
++        else:
++            reason = _http_status_reason(response.status_code)
++    elif isinstance(
++        exc,
++        (
++            TimeoutError,
++            asyncio.TimeoutError,
++            aiohttp.ServerTimeoutError,
++            requests.exceptions.Timeout,
++        ),
++    ):
++        reason = "timed out"
++    elif isinstance(
++        exc, (aiohttp.ClientConnectionError, requests.exceptions.ConnectionError)
++    ):
++        reason = "could not connect (DNS or connection error)"
++    elif isinstance(exc, (aiohttp.ClientError, requests.exceptions.RequestException)):
++        reason = type(exc).__name__
++    else:
++        return exc
++    return VLLMValidationError(f"{where}: {reason}")
++
++
+ MODALITY_IO_MAP: dict[str, type[MediaIO]] = {
+     "audio": AudioMediaIO,
+     "image": ImageMediaIO,
+@@ -303,11 +363,17 @@ class MediaConnector:
+                 return media_io.load_bytes(cached)
+ 
+             connection = self.connection
+-            data = connection.get_bytes(
+-                url_spec.url,
+-                timeout=fetch_timeout,
+-                allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+-            )
++            try:
++                data = connection.get_bytes(
++                    url_spec.url,
++                    timeout=fetch_timeout,
++                    allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
++                )
++            except Exception as e:
++                wrapped = _wrap_media_fetch_error(url_spec, e)
++                if wrapped is e:
++                    raise
++                raise wrapped from e
+ 
+             self._put_cached_bytes(url, data)
+             return media_io.load_bytes(data)
+@@ -348,11 +414,17 @@ class MediaConnector:
+                 return await future
+ 
+             connection = self.connection
+-            data = await connection.async_get_bytes(
+-                url_spec.url,
+-                timeout=fetch_timeout,
+-                allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+-            )
++            try:
++                data = await connection.async_get_bytes(
++                    url_spec.url,
++                    timeout=fetch_timeout,
++                    allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
++                )
++            except Exception as e:
++                wrapped = _wrap_media_fetch_error(url_spec, e)
++                if wrapped is e:
++                    raise
++                raise wrapped from e
+ 
+             await loop.run_in_executor(
+                 global_thread_pool, self._put_cached_bytes, url, data
