@@ -209,10 +209,18 @@ index 30921f3d74..01c7a7ffdc 100644
      def _fill_bitmasks(
          self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]
 diff --git a/vllm/v1/structured_output/backend_xgrammar.py b/vllm/v1/structured_output/backend_xgrammar.py
-index 4f199a1a27..7ed0a8df37 100644
+index 4f199a1a27..ffdfc09394 100644
 --- a/vllm/v1/structured_output/backend_xgrammar.py
 +++ b/vllm/v1/structured_output/backend_xgrammar.py
-@@ -17,6 +17,7 @@ from vllm.v1.structured_output.backend_types import (
+@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
+ import torch
+ 
+ import vllm.envs
++from vllm.exceptions import VLLMValidationError
+ from vllm.logger import init_logger
+ from vllm.sampling_params import SamplingParams
+ from vllm.utils.import_utils import LazyLoader
+@@ -17,6 +18,7 @@ from vllm.v1.structured_output.backend_types import (
      StructuredOutputGrammar,
      StructuredOutputOptions,
  )
@@ -220,20 +228,23 @@ index 4f199a1a27..7ed0a8df37 100644
  from vllm.v1.structured_output.utils import (
      choice_as_grammar,
      compile_regex_with_timeout,
-@@ -269,6 +270,12 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
+@@ -269,6 +271,15 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
      return check_object(schema)
  
  
-+class XgrammarJSONSchemaError(ValueError):
++class XgrammarJSONSchemaError(VLLMValidationError):
 +    """xgrammar cannot convert the JSON schema into a grammar (e.g. an empty
 +    ``enum``). The engine compiles with a single backend, normally xgrammar,
-+    so such a schema must be rejected rather than routed to another backend."""
++    so such a schema must be rejected rather than routed to another backend.
++
++    A VLLMValidationError so the API server answers 400 through its own
++    handler, without logging a traceback per request."""
 +
 +
  def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
      """Validate that the request is supported by structured output.
  
-@@ -319,8 +326,9 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
+@@ -319,8 +330,9 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
          try:
              xgr.Grammar.from_json_schema(schema)
          except Exception as err:

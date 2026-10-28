@@ -191,6 +191,9 @@ def _verify(schema, backend="auto"):
 def test_auto_validation_rejects_unconvertible_schema(schema):
     with pytest.raises(XgrammarJSONSchemaError) as exc_info:
         _verify(schema)
+    # A VLLMValidationError reaches its dedicated 400 handler, which does not
+    # log a traceback per request (a plain ValueError does).
+    assert isinstance(exc_info.value, VLLMValidationError)
     message = str(exc_info.value)
     assert message.startswith("Invalid JSON schema for structured output: ")
     assert ".cc:" not in message

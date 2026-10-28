@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 import vllm.envs
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.utils.import_utils import LazyLoader
@@ -270,10 +271,13 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
     return check_object(schema)
 
 
-class XgrammarJSONSchemaError(ValueError):
+class XgrammarJSONSchemaError(VLLMValidationError):
     """xgrammar cannot convert the JSON schema into a grammar (e.g. an empty
     ``enum``). The engine compiles with a single backend, normally xgrammar,
-    so such a schema must be rejected rather than routed to another backend."""
+    so such a schema must be rejected rather than routed to another backend.
+
+    A VLLMValidationError so the API server answers 400 through its own
+    handler, without logging a traceback per request."""
 
 
 def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
