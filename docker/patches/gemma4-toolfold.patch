@@ -95,6 +95,96 @@ index cb289d04e3..7a21b748e1 100644
  
  
  def _dump_engine_exception(
+diff --git a/vllm/parser/engine/parser_engine.py b/vllm/parser/engine/parser_engine.py
+index 6848a90514..d10a398300 100644
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -348,6 +348,10 @@ class ParserEngine(Parser):
+                 streamable.add(key)
+         return streamable
+ 
++    def _tool_properties(self, func_name: str) -> dict:
++        """Return the schema properties used to fix a tool's argument types."""
++        return find_tool_properties(self._tools, func_name)
++
+     def _fix_arg_types(self, args_json: str, func_name: str) -> str:
+         """Correct parameter types using the tool schema.
+ 
+@@ -365,7 +369,7 @@ class ParserEngine(Parser):
+         if not isinstance(args, dict):
+             return args_json
+ 
+-        properties = find_tool_properties(self._tools, func_name)
++        properties = self._tool_properties(func_name)
+         if not properties:
+             return args_json
+ 
+@@ -783,9 +787,7 @@ class ParserEngine(Parser):
+         slot = self._tool_slots[idx]
+         slot.name = name
+         slot.name_sent = True
+-        slot.string_keys = self._streamable_string_keys(
+-            find_tool_properties(self._tools, name)
+-        )
++        slot.string_keys = self._streamable_string_keys(self._tool_properties(name))
+         self._ensure_tool_id(slot, name)
+         deltas.append(
+             DeltaToolCall(
+@@ -842,7 +844,7 @@ class ParserEngine(Parser):
+                 slot.name = name
+                 slot.name_sent = True
+                 slot.string_keys = self._streamable_string_keys(
+-                    find_tool_properties(self._tools, name)
++                    self._tool_properties(name)
+                 )
+                 self._ensure_tool_id(slot, name)
+                 deltas.append(
+diff --git a/vllm/parser/gemma4.py b/vllm/parser/gemma4.py
+index e9223ee72f..476f2b2e14 100644
+--- a/vllm/parser/gemma4.py
++++ b/vllm/parser/gemma4.py
+@@ -26,6 +26,8 @@ from vllm.parser.engine.parser_engine_config import (
+     ParserState,
+     Transition,
+ )
++from vllm.tool_parsers.gemma4_utils import normalize_tool_parameters
++from vllm.tool_parsers.utils import find_tool_parameters
+ 
+ if TYPE_CHECKING:
+     from vllm.entrypoints.openai.chat_completion.protocol import (
+@@ -437,6 +439,7 @@ class Gemma4Parser(ParserEngine):
+     ) -> None:
+         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
+         self._thinking_enabled = chat_kwargs.get("enable_thinking", True)
++        self._normalized_tool_properties: dict[str, tuple] = {}
+         super().__init__(
+             tokenizer,
+             tools,
+@@ -451,6 +454,24 @@ class Gemma4Parser(ParserEngine):
+         self._prefix_stripped: bool = False
+         self._is_first_feed: bool = True
+ 
++    def _tool_properties(self, func_name: str) -> dict:
++        """Fix argument types against the schema the prompt showed.
++
++        A root ``$ref`` / ``allOf`` / ``anyOf`` / ``oneOf`` has no ``properties`` of its
++        own, so without this ``"days": "3"`` stays a string.
++        """
++        parameters = find_tool_parameters(self._tools, func_name)
++        cached = self._normalized_tool_properties.get(func_name)
++        if cached is not None and cached[0] is parameters:
++            return cached[1]
++        normalized = normalize_tool_parameters(parameters)
++        properties = (
++            normalized.get("properties") if isinstance(normalized, dict) else {}
++        )
++        properties = properties if isinstance(properties, dict) else {}
++        self._normalized_tool_properties[func_name] = (parameters, properties)
++        return properties
++
+     def adjust_request(
+         self,
+         request: ChatCompletionRequest | ResponsesRequest,
 diff --git a/vllm/tool_parsers/gemma4_engine_tool_parser.py b/vllm/tool_parsers/gemma4_engine_tool_parser.py
 index 04c03ecaa2..fecb6fd82e 100644
 --- a/vllm/tool_parsers/gemma4_engine_tool_parser.py
@@ -819,6 +909,33 @@ index 0000000000..df525d1cca
 +    if len(text) > max(_MAX_GROWTH * len(schema_str), 4096) or len(text) > _MAX_CHARS:
 +        return schema_str, 0
 +    return text, folder.changed
+diff --git a/vllm/tool_parsers/utils.py b/vllm/tool_parsers/utils.py
+index a31420cf1c..a8dfbc9302 100644
+--- a/vllm/tool_parsers/utils.py
++++ b/vllm/tool_parsers/utils.py
+@@ -197,6 +197,22 @@ def find_tool_properties(
+     return {}
+ 
+ 
++def find_tool_parameters(
++    tools: list[Tool] | None,
++    tool_name: str,
++) -> dict[str, Any] | None:
++    """Find a tool by name and return its parameters schema, or None."""
++    if not tools:
++        return None
++    for tool in tools:
++        if not _is_function_tool(tool):
++            continue
++        name, params = _extract_tool_info(tool)
++        if name == tool_name:
++            return params
++    return None
++
++
+ def find_tool_name(
+     tools: list[Tool] | None,
+     tool_name: str,
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
 index f97f697ded..6abdfc79e0 100644
 --- a/vllm/v1/engine/core.py

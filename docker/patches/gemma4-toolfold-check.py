@@ -6,9 +6,14 @@ from unittest.mock import MagicMock
 
 import jinja2
 
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionToolsParam,
+    FunctionDefinition,
+)
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.model_executor.layers.utils import get_penalties_rows_per_chunk
 from vllm.multimodal.media.connector import _wrap_media_fetch_error
+from vllm.parser.gemma4 import Gemma4Parser
 from vllm.tool_parsers.gemma4_engine_tool_parser import Gemma4EngineToolParser
 from vllm.v1.structured_output.request import GRAMMAR_COMPILE_ERROR_PREFIX
 
@@ -17,6 +22,7 @@ CITY = {
     "properties": {"city": {"type": "string"}},
     "required": ["city"],
 }
+ROOT = {"type": "object", "properties": {"days": {"type": "integer"}}}
 
 
 def render(parameters):
@@ -53,6 +59,17 @@ assert render(CITY) == render({"allOf": [CITY]})
 # The request's plain schema must pass through as the same object.
 plain = {"type": "function", "function": {"name": "t", "parameters": CITY}}
 assert Gemma4EngineToolParser.tools_for_chat_template([plain])[0] is plain
+
+# The reply's types must be fixed from the same schema.
+parser = Gemma4Parser.__new__(Gemma4Parser)
+parser._tools = [
+    ChatCompletionToolsParam(
+        type="function",
+        function=FunctionDefinition(name="t", parameters={"allOf": [ROOT]}),
+    )
+]
+parser._normalized_tool_properties = {}
+assert json.loads(parser._fix_arg_types('{"days": "3"}', "t")) == {"days": 3}
 
 # The crash dump must take the scheduler's requests.
 assert "requests" in inspect.signature(dump_engine_exception).parameters
