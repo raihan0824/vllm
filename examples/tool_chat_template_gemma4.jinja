@@ -99,9 +99,7 @@
             {%- endfor -%}
             ],
         {%- endif -%}
-        {%- if params['type'] -%}
-            type:<|"|>{{- params['type'] | upper -}}<|"|>}
-        {%- endif -%}
+        type:<|"|>{{- (params['type'] or 'object') | upper -}}<|"|>}
     {%- endif -%}
     {%- if 'response' in tool_data['function'] -%}
         {%- set response_declaration = tool_data['function']['response'] -%}

@@ -35,9 +35,167 @@ Ported from ``transformers.models.gemma4.utils_gemma4`` so that vLLM users
 do not need a transformers dependency for output parsing.
 """
 
+import json
+from typing import Any
+
 import regex as re
 
+from vllm.tool_parsers.json_schema_fold import fold_schema_combinators
+
 # Tool call delimiter tokens as they appear in decoded text.
+# The Gemma 4 chat template renders only a node's own properties / required / type.
+_SCHEMA_COMBINATOR_MARKERS = ('"allOf"', '"anyOf"', '"oneOf"', '"$ref"', '"if"')
+_SCHEMA_DROPPED_KEYS = frozenset(
+    ("$ref", "$defs", "definitions", "allOf", "anyOf", "oneOf", "if", "then", "else")
+)
+_SCHEMA_MAX_DEPTH = 32
+_SCHEMA_MAX_NODES = 20000
+
+
+class _SchemaTooLarge(Exception):
+    """Inlining would expand past the limit: keep the client's schema."""
+
+
+class _PromptSchema:
+    """Rewrite a folded JSON schema into what the Gemma 4 template can render.
+
+    Only for the prompt: the request keeps the client's schema. Local ``$ref`` are
+    inlined; ``anyOf`` / ``oneOf`` of objects become one object with the union of the
+    properties and the keys every branch requires; a null branch becomes ``nullable``.
+    """
+
+    def __init__(self, root: dict[str, Any]) -> None:
+        self.root = root
+        self.nodes = 0
+
+    def resolve(self, ref: Any) -> dict[str, Any] | None:
+        if not isinstance(ref, str) or not ref.startswith("#/"):
+            return None
+        target: Any = self.root
+        for part in ref[2:].split("/"):
+            part = part.replace("~1", "/").replace("~0", "~")
+            if not isinstance(target, dict) or part not in target:
+                return None
+            target = target[part]
+        return target if isinstance(target, dict) else None
+
+    def union(self, branches: list[dict[str, Any]]) -> dict[str, Any]:
+        non_null = [b for b in branches if b.get("type") != "null"]
+        if not non_null:
+            return {"type": "null"}
+        nullable = len(non_null) < len(branches)
+        if len(non_null) == 1:
+            out = dict(non_null[0])
+        elif all(isinstance(b.get("properties"), dict) for b in non_null):
+            properties: dict[str, Any] = {}
+            for branch in non_null:
+                for name, sub in branch["properties"].items():
+                    properties.setdefault(name, sub)
+            required = [
+                key
+                for key in non_null[0].get("required") or []
+                if all(key in (b.get("required") or []) for b in non_null)
+            ]
+            out = {"type": "object", "properties": properties}
+            if required:
+                out["required"] = required
+        else:
+            # The template has room for one type: the first branch stands for all.
+            out = dict(non_null[0])
+        if nullable:
+            out["nullable"] = True
+        return out
+
+    def node(self, schema: Any, depth: int, seen: tuple[str, ...] = ()) -> Any:
+        if not isinstance(schema, dict):
+            return schema
+        self.nodes += 1
+        if self.nodes > _SCHEMA_MAX_NODES:
+            raise _SchemaTooLarge
+        out = {k: v for k, v in schema.items() if k not in _SCHEMA_DROPPED_KEYS}
+        if depth > _SCHEMA_MAX_DEPTH:
+            return out
+
+        ref = schema.get("$ref")
+        if ref is not None:
+            target = self.resolve(ref) if ref not in seen else None
+            if target is not None:
+                inlined = self.node(target, depth + 1, (*seen, ref))
+                out = {**inlined, **out}
+
+        for branch in schema.get("allOf") or []:
+            merged = self.node(branch, depth + 1, seen)
+            if not isinstance(merged, dict):
+                continue
+            own_properties = out.get("properties")
+            own_required = out.get("required")
+            out = {**merged, **out}
+            if isinstance(own_properties, dict):
+                out["properties"] = {**merged.get("properties", {}), **own_properties}
+            if isinstance(own_required, list):
+                extra = merged.get("required") or []
+                out["required"] = own_required + [
+                    key for key in extra if key not in own_required
+                ]
+
+        for key in ("anyOf", "oneOf"):
+            branches = schema.get(key)
+            if isinstance(branches, list) and branches:
+                nodes = [self.node(b, depth + 1, seen) for b in branches]
+                out = {
+                    **self.union([b for b in nodes if isinstance(b, dict)]),
+                    **out,
+                }
+                break
+
+        if isinstance(out.get("properties"), dict):
+            out["properties"] = {
+                name: self.node(sub, depth + 1, seen)
+                for name, sub in out["properties"].items()
+            }
+        if isinstance(out.get("items"), dict):
+            out["items"] = self.node(out["items"], depth + 1, seen)
+        return out
+
+
+def normalize_tool_parameters(parameters: Any) -> Any:
+    """Rewrite a tool's parameters for the Gemma 4 chat template.
+
+    A schema with no combinators or ``$ref`` is returned as is, so its prompt does not
+    change. Any failure also returns the client's schema.
+    """
+    if not isinstance(parameters, dict):
+        return parameters
+    try:
+        text = json.dumps(parameters)
+        if not any(marker in text for marker in _SCHEMA_COMBINATOR_MARKERS):
+            return parameters
+        folded = json.loads(fold_schema_combinators(text)[0])
+        out = _PromptSchema(folded).node(folded, 0)
+    except (TypeError, ValueError, RecursionError, _SchemaTooLarge):
+        return parameters
+    if not isinstance(out, dict) or not out:
+        return parameters
+    if isinstance(out.get("properties"), dict):
+        out.setdefault("type", "object")
+    return out
+
+
+def normalize_tools_for_template(
+    tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return tools whose parameters the Gemma 4 chat template can render."""
+    out = []
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if isinstance(function, dict) and "parameters" in function:
+            parameters = normalize_tool_parameters(function["parameters"])
+            if parameters is not function["parameters"]:
+                tool = {**tool, "function": {**function, "parameters": parameters}}
+        out.append(tool)
+    return out
+
+
 # Standard format: <|tool_call>call:name{args}<tool_call|>
 _TOOL_CALL_START_TAG = "<|tool_call>"
 _TOOL_CALL_END_TAG = "<tool_call|>"

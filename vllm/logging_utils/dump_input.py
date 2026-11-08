@@ -4,6 +4,9 @@
 import contextlib
 import enum
 import json
+from collections import Counter
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 
@@ -57,11 +60,64 @@ def dump_engine_exception(
     config: VllmConfig,
     scheduler_output: SchedulerOutput,
     scheduler_stats: SchedulerStats | None,
+    requests: Mapping[str, Any] | None = None,
 ):
     # NOTE: ensure we can log extra info without risking raises
     # unexpected errors during logging
     with contextlib.suppress(Exception):
         _dump_engine_exception(config, scheduler_output, scheduler_stats)
+    with contextlib.suppress(Exception):
+        _dump_request_summary(scheduler_output, requests)
+
+
+def _mm_item_shapes(feature: Any) -> dict[str, Any] | None:
+    """Tensor shapes of one multimodal item; None if the item was sent as cached."""
+    if feature.data is None:
+        return None
+    shapes: dict[str, Any] = {}
+    for key, elem in feature.data.items():
+        value = getattr(elem, "data", elem)
+        shapes[key] = (
+            tuple(value.shape) if hasattr(value, "shape") else type(value).__name__
+        )
+    return shapes
+
+
+def _dump_request_summary(
+    scheduler_output: SchedulerOutput,
+    requests: Mapping[str, Any] | None,
+) -> None:
+    """Log each scheduled request's size, which the output omits for cached requests.
+
+    ``mm_ranges`` is the request's share of the attention kernel's MAX_MM_RANGES.
+    """
+    if not requests:
+        return
+    encoder_inputs = scheduler_output.scheduled_encoder_inputs
+    for req_id, num_scheduled in scheduler_output.num_scheduled_tokens.items():
+        request = requests.get(req_id)
+        if request is None:
+            continue
+        features = request.mm_features
+        items = Counter(feature.modality for feature in features)
+        ranges = sum(
+            len(feature.mm_position.extract_embeds_range()) for feature in features
+        )
+        shapes = {
+            idx: _mm_item_shapes(features[idx])
+            for idx in encoder_inputs.get(req_id, [])
+        }
+        logger.error(
+            "Dumping scheduled request: req_id=%s prompt_tokens=%d computed_tokens=%d "
+            "scheduled_tokens=%d mm_items=%s mm_ranges=%d encoder_inputs=%s",
+            req_id,
+            request.num_prompt_tokens,
+            request.num_computed_tokens,
+            num_scheduled,
+            dict(items),
+            ranges,
+            shapes,
+        )
 
 
 def _dump_engine_exception(

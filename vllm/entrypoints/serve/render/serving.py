@@ -894,6 +894,13 @@ class OpenAIServingRender:
         renderer = self.renderer
         mm_config = self.model_config.multimodal_config
 
+        if tool_dicts and parser is not None and parser.tool_parser_cls is not None:
+            rewrite_tools = getattr(
+                parser.tool_parser_cls, "tools_for_chat_template", None
+            )
+            if rewrite_tools is not None:
+                tool_dicts = rewrite_tools(tool_dicts)
+
         default_template_kwargs = merge_kwargs(
             default_template_kwargs,
             dict(
