@@ -1,0 +1,29 @@
+# Gemma-4-26B: tool schemas the chat template could not render, and a crash dump
+# that names the request. Overlay on the live image, no other change.
+# 1. A root $ref / allOf / anyOf / oneOf rendered as parameters:{} with an unbalanced
+#    brace, so the model saw no parameter names and every call came back as {}.
+# 2. The 2026-11-09 illegal memory access dump omitted the size of the request that was
+#    encoding images: each scheduled request's image count and shapes are now logged.
+# Patch generated against upstream v0.24.0 plus grammar-400; applied with --fuzz=0.
+#   docker build --build-arg BASE=<vllm-openai-dev:...-grammar400r2@sha256:...>
+ARG BASE
+FROM ${BASE}
+
+# The images run as UID 1000; site-packages needs root to patch.
+USER root
+
+COPY patches/gemma4-toolfold.patch /tmp/gemma4-toolfold.patch
+COPY patches/gemma4-toolfold-template.patch /tmp/gemma4-toolfold-template.patch
+COPY patches/gemma4-toolfold-check.py /tmp/gemma4-toolfold-check.py
+
+# Fail the build unless both patches apply exactly and the shapes render.
+RUN set -e; \
+    VLLM_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))"); \
+    cd "$(dirname "$VLLM_DIR")"; \
+    patch -p1 --fuzz=0 --no-backup-if-mismatch < /tmp/gemma4-toolfold.patch; \
+    cd /vllm-workspace/examples; \
+    patch -p1 --fuzz=0 --no-backup-if-mismatch < /tmp/gemma4-toolfold-template.patch; \
+    cd /tmp && python3 /tmp/gemma4-toolfold-check.py; \
+    rm /tmp/gemma4-toolfold*
+
+USER 1000

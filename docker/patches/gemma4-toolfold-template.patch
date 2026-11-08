@@ -1,0 +1,15 @@
+diff --git a/tool_chat_template_gemma4.jinja b/tool_chat_template_gemma4.jinja
+index 6ce01e6479..f6be0f095c 100644
+--- a/tool_chat_template_gemma4.jinja
++++ b/tool_chat_template_gemma4.jinja
+@@ -99,9 +99,7 @@
+             {%- endfor -%}
+             ],
+         {%- endif -%}
+-        {%- if params['type'] -%}
+-            type:<|"|>{{- params['type'] | upper -}}<|"|>}
+-        {%- endif -%}
++        type:<|"|>{{- (params['type'] or 'object') | upper -}}<|"|>}
+     {%- endif -%}
+     {%- if 'response' in tool_data['function'] -%}
+         {%- set response_declaration = tool_data['function']['response'] -%}
