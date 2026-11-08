@@ -14,11 +14,17 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import jinja2
+import jsonschema
 import pytest
 import torch
 
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionToolsParam,
+    FunctionDefinition,
+)
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.parser.gemma4 import Gemma4Parser
 from vllm.tool_parsers.gemma4_engine_tool_parser import Gemma4EngineToolParser
 from vllm.tool_parsers.gemma4_utils import (
     normalize_tool_parameters,
@@ -231,6 +237,52 @@ class TestNormalize:
     def test_malformed_properties_do_not_raise(self):
         schema = {"anyOf": [{"type": "object"}], "properties": "p"}
         assert normalize_tool_parameters(schema)["properties"] == "p"
+
+
+class TestArgumentTypes:
+    """The model writes "3" for an integer; the parser fixes it from the schema."""
+
+    def fix(self, schema: dict, args: str) -> dict:
+        parser = Gemma4Parser.__new__(Gemma4Parser)
+        parser._tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(name="get_forecast", parameters=schema),
+            )
+        ]
+        parser._normalized_tool_properties = {}
+        return json.loads(parser._fix_arg_types(args, "get_forecast"))
+
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            CITY,
+            {"$ref": "#/$defs/W", "$defs": {"W": CITY}},
+            {"allOf": [CITY]},
+            {"type": "object", "allOf": [CITY]},
+            {"anyOf": [CITY, ZIP]},
+            {"oneOf": [CITY, ZIP]},
+        ],
+    )
+    def test_integer_is_fixed_for_every_root_shape(self, schema):
+        out = self.fix(schema, '{"city": "Jakarta", "days": "3"}')
+        assert out == {"city": "Jakarta", "days": 3}
+        jsonschema.Draft202012Validator(schema).validate(out)
+
+    def test_nested_ref(self):
+        schema = {
+            "type": "object",
+            "properties": {"q": {"$ref": "#/$defs/W"}},
+            "required": ["q"],
+            "$defs": {"W": CITY},
+        }
+        out = self.fix(schema, '{"q": {"city": "Jakarta", "days": "3"}}')
+        assert out == {"q": {"city": "Jakarta", "days": 3}}
+        jsonschema.Draft202012Validator(schema).validate(out)
+
+    def test_unresolvable_schema_keeps_the_string(self):
+        schema = {"$ref": "https://example.com/s.json"}
+        assert self.fix(schema, '{"days": "3"}') == {"days": "3"}
 
 
 class TestTemplateBrace:

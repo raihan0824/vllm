@@ -348,6 +348,10 @@ class ParserEngine(Parser):
                 streamable.add(key)
         return streamable
 
+    def _tool_properties(self, func_name: str) -> dict:
+        """Return the schema properties used to fix a tool's argument types."""
+        return find_tool_properties(self._tools, func_name)
+
     def _fix_arg_types(self, args_json: str, func_name: str) -> str:
         """Correct parameter types using the tool schema.
 
@@ -365,7 +369,7 @@ class ParserEngine(Parser):
         if not isinstance(args, dict):
             return args_json
 
-        properties = find_tool_properties(self._tools, func_name)
+        properties = self._tool_properties(func_name)
         if not properties:
             return args_json
 
@@ -783,9 +787,7 @@ class ParserEngine(Parser):
         slot = self._tool_slots[idx]
         slot.name = name
         slot.name_sent = True
-        slot.string_keys = self._streamable_string_keys(
-            find_tool_properties(self._tools, name)
-        )
+        slot.string_keys = self._streamable_string_keys(self._tool_properties(name))
         self._ensure_tool_id(slot, name)
         deltas.append(
             DeltaToolCall(
@@ -842,7 +844,7 @@ class ParserEngine(Parser):
                 slot.name = name
                 slot.name_sent = True
                 slot.string_keys = self._streamable_string_keys(
-                    find_tool_properties(self._tools, name)
+                    self._tool_properties(name)
                 )
                 self._ensure_tool_id(slot, name)
                 deltas.append(

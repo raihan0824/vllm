@@ -197,6 +197,22 @@ def find_tool_properties(
     return {}
 
 
+def find_tool_parameters(
+    tools: list[Tool] | None,
+    tool_name: str,
+) -> dict[str, Any] | None:
+    """Find a tool by name and return its parameters schema, or None."""
+    if not tools:
+        return None
+    for tool in tools:
+        if not _is_function_tool(tool):
+            continue
+        name, params = _extract_tool_info(tool)
+        if name == tool_name:
+            return params
+    return None
+
+
 def find_tool_name(
     tools: list[Tool] | None,
     tool_name: str,

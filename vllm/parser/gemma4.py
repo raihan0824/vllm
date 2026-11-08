@@ -26,6 +26,8 @@ from vllm.parser.engine.parser_engine_config import (
     ParserState,
     Transition,
 )
+from vllm.tool_parsers.gemma4_utils import normalize_tool_parameters
+from vllm.tool_parsers.utils import find_tool_parameters
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -437,6 +439,7 @@ class Gemma4Parser(ParserEngine):
     ) -> None:
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
         self._thinking_enabled = chat_kwargs.get("enable_thinking", True)
+        self._normalized_tool_properties: dict[str, tuple] = {}
         super().__init__(
             tokenizer,
             tools,
@@ -450,6 +453,24 @@ class Gemma4Parser(ParserEngine):
         self._reasoning_text: str = ""
         self._prefix_stripped: bool = False
         self._is_first_feed: bool = True
+
+    def _tool_properties(self, func_name: str) -> dict:
+        """Fix argument types against the schema the prompt showed.
+
+        A root ``$ref`` / ``allOf`` / ``anyOf`` / ``oneOf`` has no ``properties`` of its
+        own, so without this ``"days": "3"`` stays a string.
+        """
+        parameters = find_tool_parameters(self._tools, func_name)
+        cached = self._normalized_tool_properties.get(func_name)
+        if cached is not None and cached[0] is parameters:
+            return cached[1]
+        normalized = normalize_tool_parameters(parameters)
+        properties = (
+            normalized.get("properties") if isinstance(normalized, dict) else {}
+        )
+        properties = properties if isinstance(properties, dict) else {}
+        self._normalized_tool_properties[func_name] = (parameters, properties)
+        return properties
 
     def adjust_request(
         self,
