@@ -1,5 +1,6 @@
 # Probe Gemma-4 tool calls per schema shape: is the call conformant, cut, or empty?
 import json, sys, urllib.request, urllib.error
+import jsonschema
 base, model = sys.argv[1], sys.argv[2]
 CALL = {"type": "object", "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}}, "required": ["name", "arguments"]}
 CALLS = {"type": "object", "properties": {"calls": {"type": "array", "items": CALL}}, "required": ["calls"]}
@@ -9,6 +10,10 @@ SHAPES = {
   "root $ref": ({"$ref": "#/$defs/W", "$defs": {"W": CITY}}, ["city", "days"]),
   "root allOf": ({"allOf": [CITY]}, ["city", "days"]),
   "root anyOf": ({"anyOf": [CITY, {"type": "object", "properties": {"zip": {"type": "string"}}, "required": ["zip"]}]}, None),
+  "root oneOf": ({"oneOf": [CITY, {"type": "object", "properties": {"zip": {"type": "string"}}, "required": ["zip"]}]}, None),
+  "typed+allOf": ({"type": "object", "allOf": [CITY]}, ["city", "days"]),
+  "no root type": ({"properties": CITY["properties"], "required": ["city", "days"]}, ["city", "days"]),
+  "optional anyOf": ({"type": "object", "properties": {"city": {"type": "string"}, "days": {"anyOf": [{"type": "integer"}, {"type": "null"}]}}, "required": ["city"]}, ["city"]),
   "nested $ref": ({"type": "object", "properties": {"q": {"$ref": "#/$defs/W"}}, "required": ["q"], "$defs": {"W": CITY}}, ["q"]),
   "wrapper calls": (CALLS, ["calls"]),
 }
@@ -24,7 +29,7 @@ def go(params, prompt, choice, max_tokens, stream=False):
         return e.code, {"err": e.read()[:200].decode(errors="replace")}
 for name, (params, req) in SHAPES.items():
     for choice in ("auto", "required"):
-        res = {"call_ok": 0, "call_missing_keys": 0, "call_empty": 0, "no_call": 0, "http_err": 0}
+        res = {"valid": 0, "invalid": 0, "empty": 0, "no_call": 0, "http_err": 0}
         sample = ""
         for p in PROMPTS:
             s, o = go(params, p, choice, 200)
@@ -37,9 +42,9 @@ for name, (params, req) in SHAPES.items():
                 a = json.loads(tc[0]["function"]["arguments"] or "{}")
             except Exception:
                 a = None
-            if not a: res["call_empty"] += 1
-            elif req and any(k not in a for k in req): res["call_missing_keys"] += 1
-            else: res["call_ok"] += 1
+            if not a: res["empty"] += 1
+            elif jsonschema.Draft202012Validator(params).is_valid(a): res["valid"] += 1
+            else: res["invalid"] += 1
             sample = sample or tc[0]["function"]["arguments"][:110]
         print(f"{name:14s} {choice:9s} {res} e.g. {sample}", flush=True)
 print("== cut call: max_tokens too small")

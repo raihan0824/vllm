@@ -154,7 +154,9 @@ async def background(session, args, deadline, state):
                 "max_tokens": local.choice((64, 256)),
                 "temperature": 0,
             }
-            await post(session, url, body)
+            status, _ = await post(session, url, body)
+            if status != 200:
+                await asyncio.sleep(0.2)
 
     async def one_image():
         while time.time() < deadline and not state["down"]:
@@ -165,7 +167,9 @@ async def background(session, args, deadline, state):
                 "max_tokens": 16,
                 "temperature": 0,
             }
-            await post(session, url, body)
+            status, _ = await post(session, url, body)
+            if status != 200:
+                await asyncio.sleep(0.2)
 
     await asyncio.gather(*(text() for _ in range(2)), one_image())
 
