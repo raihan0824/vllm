@@ -998,18 +998,26 @@ class SamplingParams(
                         schema = so_params.json
                     skip_guidance = has_guidance_unsupported_json_features(schema)
 
-                if skip_guidance:
-                    # Fall back to outlines if the tokenizer is non-tekken Mistral or
-                    # the schema contains features unsupported by guidance
-                    validate_structured_output_request_outlines(self)
-                    self.structured_outputs._backend = "outlines"
-                else:
-                    # Fall back to guidance by default.
-                    validate_guidance_grammar(
-                        self,
-                        tokenizer=_get_llg_tokenizer(tokenizer),
-                    )
-                    self.structured_outputs._backend = "guidance"
+                try:
+                    if skip_guidance:
+                        # Fall back to outlines if the tokenizer is non-tekken Mistral
+                        # or the schema contains features unsupported by guidance
+                        validate_structured_output_request_outlines(self)
+                        self.structured_outputs._backend = "outlines"
+                    else:
+                        # Fall back to guidance by default.
+                        validate_guidance_grammar(
+                            self,
+                            tokenizer=_get_llg_tokenizer(tokenizer),
+                        )
+                        self.structured_outputs._backend = "guidance"
+                except VLLMValidationError:
+                    raise
+                except ValueError as e:
+                    # No backend can serve this request. A plain ValueError also
+                    # gives a 400, but the API server then re-raises it, which logs
+                    # a traceback and counts as a 5xx.
+                    raise VLLMValidationError(str(e)) from e
             # Remember that this backend was set automatically
             self.structured_outputs._backend_was_auto = True
 

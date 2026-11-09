@@ -9,10 +9,13 @@ from http import HTTPStatus
 from unittest.mock import Mock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from tests.v1.core.utils import EOS_TOKEN_ID, create_requests, create_scheduler
 from vllm.config import StructuredOutputsConfig
 from vllm.entrypoints.serve.utils.error_response import create_error_response
+from vllm.entrypoints.serve.utils.server_utils import exception_handler
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.engine import EngineCoreOutput, FinishReason
@@ -214,6 +217,49 @@ def test_auto_validation_keeps_fallback_for_unsupported_features(monkeypatch):
         {"type": "array", "items": {"type": "string"}, "uniqueItems": True}
     )
     assert params.structured_outputs._backend == "guidance"
+
+
+def _unservable_schema(monkeypatch):
+    """A schema xgrammar lacks a keyword for, which guidance rejects too."""
+    import vllm.sampling_params as sp
+
+    monkeypatch.setattr(sp, "_get_llg_tokenizer", lambda tok: Mock(), raising=False)
+
+    def reject(*args, **kwargs):
+        raise ValueError('Grammar error: Unimplemented keys: ["uniqueItems"]')
+
+    monkeypatch.setattr(
+        "vllm.v1.structured_output.backend_guidance.validate_guidance_grammar",
+        reject,
+    )
+    return {"type": "array", "uniqueItems": True, "items": {"enum": []}}
+
+
+def test_auto_validation_rejects_schema_no_backend_can_serve(monkeypatch):
+    schema = _unservable_schema(monkeypatch)
+    with pytest.raises(VLLMValidationError) as exc_info:
+        _verify(schema)
+    # The client's message is unchanged.
+    assert str(exc_info.value) == 'Grammar error: Unimplemented keys: ["uniqueItems"]'
+    assert create_error_response(exc_info.value).error.code == HTTPStatus.BAD_REQUEST
+
+
+def test_schema_no_backend_can_serve_is_not_reraised_by_the_server(monkeypatch):
+    # A plain ValueError goes to the catch-all Exception handler: the client gets
+    # a 400, but Starlette then re-raises it, which logs a traceback per request
+    # and counts as a 5xx. TestClient raises in that case.
+    schema = _unservable_schema(monkeypatch)
+    app = FastAPI()
+    app.exception_handler(VLLMValidationError)(exception_handler)
+    app.exception_handler(Exception)(exception_handler)
+
+    @app.post("/check")
+    async def check():
+        _verify(schema)
+
+    response = TestClient(app).post("/check")
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert "uniqueItems" in response.json()["error"]["message"]
 
 
 def test_auto_validation_accepts_valid_schema():
