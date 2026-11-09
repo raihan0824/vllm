@@ -250,6 +250,7 @@ def test_schema_no_backend_can_serve_is_not_reraised_by_the_server(monkeypatch):
     # and counts as a 5xx. TestClient raises in that case.
     schema = _unservable_schema(monkeypatch)
     app = FastAPI()
+    app.state.args = Mock(log_error_stack=False)
     app.exception_handler(VLLMValidationError)(exception_handler)
     app.exception_handler(Exception)(exception_handler)
 
